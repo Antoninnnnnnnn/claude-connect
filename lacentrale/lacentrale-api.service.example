@@ -1,0 +1,17 @@
+[Unit]
+Description=La Centrale Search API
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/path/to/claude-connect/.env
+WorkingDirectory=/path/to/claude-connect/lacentrale
+ExecStart=/bin/bash -lc 'exec /path/to/claude-connect/lacentrale/.venv/bin/uvicorn app.main:app --host ${CENTRALE_HOST:-0.0.0.0} --port ${CENTRALE_PORT:-8094}'
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,5 @@
+aggs 200 {"aggs":{"location.visitPlace.region":[{"key":"FR-HDF","count":1},{"key":"FR-IDF","count":21},{"key":"FR-NOR","count":2}]},"hits":[],"seed":20260614122,"total":24}
+cookies {}
+v5/search 200 {"hits":[{"item":{"picturesPhotosphere":false,"customerFamilyCode":"CENTRE_MULTIMARQUES","goodDealBadge":"BAD_DEAL","publicationOptions":["PHOTO_360","PHOTO_LISTING","PHOTO_WEB","WEB_IMMEDIAT","STRENGTHS","MULTI_PHOTOS"],"vehicle":{"externalColor":"gris clair","year":2015,"detailedModel":"RENAULT ZO
+v5/classifieds 404 
+v4/search 200 {"hits":[{"item":{"picturesPhotosphere":false,"customerFamilyCode":"PART","goodDealBadge":"GOOD_DEAL","vehicle":{"externalColor":"blanc undefined","year":2017,"detailedModel":"RENAULT ZOE","version":"R90 INTENS 41KWH","doors":5,"trimLevel":"INTENS","model":"ZOE","gearbox":"AUTO","category":"CITADINE

@@ -1,0 +1,56 @@
+# Secrets & credentials
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+*/.venv/
+*/venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Session cookies & runtime data
+*/data/cookies.json
+*/data/server.pid
+
+# EcoleDirecte security-question answers (personal)
+ecoledirecte/qcm.json
+
+# Personal deploy docs (domain, VPS IP, real API key)
+*.local.md
+*.local
+*.service.local
+
+# DevTools capture sessions (may contain cookies/tokens)
+centrale/session_*/
+
+# Local clone of upstream lbc library (use PyPI package instead)
+leboncoin-base/
+
+# Test / coverage / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Logs & local DB
+*.log
+*.sqlite3
+
+# OS & editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

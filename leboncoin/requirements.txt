@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+curl-cffi>=0.15.0
+lbc>=1.1.3
+httpx
