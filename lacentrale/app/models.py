@@ -26,6 +26,9 @@ class SearchResult(BaseModel):
     technical_sheet_url: str | None = None
     dealer: dict[str, Any] | None = None
     vehicle: dict[str, Any] | None = None
+    battery_capacity_kwh: int | None = None
+    charge_type: str | None = None
+    battery_ownership: str | None = None
     raw: dict[str, Any] | None = Field(default=None)
 
 

@@ -173,6 +173,33 @@ async def get_listing(
     return {"ok": True, "data": data}
 
 
+@app.get("/listings", dependencies=[Depends(require_api_key)])
+async def get_listings(
+    refs: str = Query(..., description="Comma-separated listing references, e.g. B104008382,W102941021"),
+    include_image: bool = Query(default=True),
+    include_dealer: bool = Query(default=False),
+    include_vehicle: bool = Query(default=True),
+    include_description: bool = Query(default=False),
+    raw: bool = Query(default=False),
+    debug: bool = Query(default=False),
+    max_workers: int = Query(default=4, ge=1, le=8),
+) -> dict[str, Any]:
+    ref_list = [part.strip() for part in refs.split(",") if part.strip()]
+    data = await anyio.to_thread.run_sync(
+        lambda: centrale.listings(
+            ref_list,
+            max_workers=max_workers,
+            include_image=include_image,
+            include_dealer=include_dealer,
+            include_vehicle=include_vehicle,
+            include_description=include_description,
+            raw=raw,
+            debug=debug,
+        )
+    )
+    return {"ok": True, "data": data}
+
+
 @app.get("/price-stats", dependencies=[Depends(require_api_key)])
 async def price_stats(
     filters: SearchFilters = Depends(search_filters_dependency),

@@ -7,6 +7,7 @@ import re
 import statistics
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -24,6 +25,24 @@ RECHERCHE_HOST = "https://recherche.lacentrale.fr"
 GEOLOC_HOST = "https://geoloc.lacentrale.fr"
 LISTING_JS_FALLBACK = f"{CENTRALE_HOST}/fragments/recherche-fragment-front/listing-7df45909.js"
 LISTING_JS_RE = re.compile(r"/fragments/recherche-fragment-front/listing-[a-f0-9]+\.js")
+FRAGMENT_JS_RE = re.compile(r'/fragments/recherche-fragment-front/[^"\'\s>]+\.js')
+
+DATADOME_DESCRIPTION_UNAVAILABLE = "Non disponible (Bloqué par DataDome)"
+
+# Last-resort upstream keys (public front-end keys; override via CENTRALE_UPSTREAM_API_KEY).
+UPSTREAM_API_KEY_FALLBACKS: tuple[str, ...] = ()
+
+BATTERY_KWH_RE = re.compile(r"\b(\d{2})\s*kwh\b", re.I)
+BATTERY_KWH_COMPACT_RE = re.compile(r"\b(\d{2})kwh\b", re.I)
+CHARGE_MOTOR_RE = re.compile(r"\b([QR])(\d{2,3})\b", re.I)
+BATTERY_LEASE_RE = re.compile(
+    r"location\s+(?:de\s+)?batterie|loyer\s+(?:de\s+)?batterie|batterie\s+lou[eé]e|\bdiac\b",
+    re.I,
+)
+BATTERY_OWNED_RE = re.compile(
+    r"achat\s+int[eé]gral|batterie\s+incluse|sans\s+location|propri[eé]t[eé]\s+batterie|batterie\s+achet[eé]e",
+    re.I,
+)
 
 ALLOWED_URL_HOSTS = frozenset(
     {
@@ -205,6 +224,73 @@ def scan_ssr_markers(html: str) -> list[str]:
     return [marker for marker in SSR_MARKERS if marker in html]
 
 
+def extract_ev_metadata(
+    *,
+    title: str | None,
+    version: str | None,
+    description: str | None = None,
+    energy: str | None = None,
+) -> dict[str, Any]:
+    """Extract EV-oriented fields from title, version and optional description."""
+    text = " ".join(
+        part for part in (title, version, description) if part
+    )
+    if not text.strip():
+        return {}
+
+    result: dict[str, Any] = {}
+    energy_upper = str(energy or "").upper()
+    is_electric = energy_upper in {"ELECTRIC", "ELECTRIQUE", "ELECTRIQUE_B"} or bool(
+        BATTERY_KWH_RE.search(text) or BATTERY_KWH_COMPACT_RE.search(text) or CHARGE_MOTOR_RE.search(text)
+    )
+    if not is_electric:
+        return result
+
+    for pattern in (BATTERY_KWH_RE, BATTERY_KWH_COMPACT_RE):
+        match = pattern.search(text)
+        if match:
+            result["battery_capacity_kwh"] = int(match.group(1))
+            break
+
+    motor_match = CHARGE_MOTOR_RE.search(text)
+    if motor_match:
+        motor_type = motor_match.group(1).upper()
+        result["charge_type"] = motor_type
+
+    normalized = text.lower()
+    if BATTERY_OWNED_RE.search(normalized):
+        result["battery_ownership"] = "purchase"
+    elif BATTERY_LEASE_RE.search(normalized):
+        result["battery_ownership"] = "lease"
+    elif "batterie" in normalized:
+        result["battery_ownership"] = "unknown"
+
+    return result
+
+
+def discover_listing_js_urls(html: str) -> list[str]:
+    """Collect candidate listing JS bundle URLs from a /listing HTML page."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for pattern in (LISTING_JS_RE, FRAGMENT_JS_RE):
+        for match in pattern.finditer(html):
+            path = match.group(0)
+            if not path.startswith("/"):
+                continue
+            url = f"{CENTRALE_HOST}{path}"
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    if LISTING_JS_FALLBACK not in seen:
+        urls.append(LISTING_JS_FALLBACK)
+    return urls
+
+
+def extract_api_key_from_js(js_source: str) -> str | None:
+    match = API_KEY_RE.search(js_source)
+    return match.group(1) if match else None
+
+
 def parse_script_var_json(html: str, var_name: str) -> dict[str, Any] | None:
     for prefix in (
         f"var {var_name} = ",
@@ -332,6 +418,7 @@ class CentraleClient:
         self._www_cookies: dict[str, str] = {}
         self._datadome_client_id: str | None = None
         self._json_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._listing_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._metadata_cache: tuple[float, dict[str, Any]] | None = None
         self._distance_buckets: dict[int, str] | None = None
         self._recherche_session: requests.Session | None = None
@@ -503,16 +590,40 @@ class CentraleClient:
         if not LISTING_REF_PATTERN.match(clean_ref):
             raise CentraleError(f"Invalid listing reference format: {ref}")
 
+        cache_key = self._listing_cache_key(
+            clean_ref,
+            include_image=include_image,
+            include_dealer=include_dealer,
+            include_vehicle=include_vehicle,
+            include_description=include_description,
+            raw=raw,
+            debug=debug,
+        )
+        cached = self._cached_listing(cache_key)
+        if cached is not None:
+            return cached
+
         item_data = self._listing_json(clean_ref)
         source = "json"
+        html_warnings: list[str] = []
+
         if item_data is None:
-            item_data = self._listing_html(clean_ref)
-            source = "html"
+            html_item, html_error = self._fetch_listing_html_enrichment(clean_ref)
+            if html_item:
+                item_data = html_item
+                source = "html"
+            elif html_error:
+                html_warnings.append(html_error)
         elif include_description or include_dealer:
-            html_item = self._listing_html(clean_ref)
+            html_item, html_error = self._fetch_listing_html_enrichment(clean_ref)
             if html_item:
                 item_data = self._merge_listing_items(item_data, html_item)
                 source = "json+html"
+            elif html_error:
+                html_warnings.append(html_error)
+                if include_description and not item_data.get("description"):
+                    item_data["description"] = DATADOME_DESCRIPTION_UNAVAILABLE
+
         if not item_data:
             raise CentraleNotFoundError(f"Listing not found: {clean_ref}")
 
@@ -527,7 +638,50 @@ class CentraleClient:
         payload: dict[str, Any] = {"item": normalized, "source": source}
         if debug:
             payload["strategy"] = self._primary_strategy()
+        if html_warnings:
+            payload["html_warnings"] = html_warnings
+        self._store_listing(cache_key, payload)
         return payload
+
+    def listings(
+        self,
+        refs: list[str],
+        *,
+        max_workers: int | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        clean_refs = []
+        seen: set[str] = set()
+        for ref in refs:
+            clean = ref.strip().upper()
+            if not clean or clean in seen:
+                continue
+            if not LISTING_REF_PATTERN.match(clean):
+                raise CentraleError(f"Invalid listing reference format: {ref}")
+            seen.add(clean)
+            clean_refs.append(clean)
+        if not clean_refs:
+            return {"items": [], "errors": {}}
+
+        workers = max(1, min(max_workers or self.settings.centrale_listing_max_workers, len(clean_refs)))
+        items: list[dict[str, Any]] = []
+        errors: dict[str, str] = {}
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(self.listing, ref, **kwargs): ref for ref in clean_refs
+            }
+            for future in as_completed(future_map):
+                ref = future_map[future]
+                try:
+                    result = future.result()
+                    items.append({"ref": ref, **result})
+                except Exception as exc:
+                    errors[ref] = str(exc)
+                    logger.warning("Parallel listing fetch failed for %s: %s", ref, exc)
+
+        items.sort(key=lambda entry: clean_refs.index(entry["ref"]))
+        return {"items": items, "errors": errors}
 
     def price_stats(self, **kwargs: Any) -> PriceStats:
         max_limit = self.max_fetchable_limit()
@@ -741,19 +895,40 @@ class CentraleClient:
         return None
 
     def _listing_html(self, ref: str) -> dict[str, Any] | None:
+        item, _error = self._fetch_listing_html_enrichment(ref)
+        return item
+
+    def _fetch_listing_html_enrichment(self, ref: str) -> tuple[dict[str, Any] | None, str | None]:
         listing_url = f"{CENTRALE_HOST}/auto-occasion-annonce-{ref}.html"
         try:
-            html = self._request_text(
+            response = self._session_request(
                 listing_url,
                 json_accept=False,
                 use_proxy=self.settings.centrale_www_use_proxy,
                 www=True,
             )
-        except CentraleError:
-            return None
-        if self._looks_blocked(html):
-            return None
-        return self._parse_detail_html(html, ref)
+        except CentraleError as exc:
+            message = str(exc).lower()
+            if any(token in message for token in ("403", "429", "blocked")):
+                logger.warning("Listing HTML blocked for %s: %s", ref, exc)
+                return None, "datadome_blocked"
+            logger.warning("Listing HTML request failed for %s: %s", ref, exc)
+            return None, "request_failed"
+
+        body = response.text if isinstance(response.text, str) else ""
+        if response.status_code in {403, 429} or self._looks_blocked(body):
+            logger.warning(
+                "Listing HTML blocked for %s (HTTP %s)",
+                ref,
+                response.status_code,
+            )
+            return None, "datadome_blocked"
+
+        parsed = self._parse_detail_html(body, ref)
+        if parsed:
+            return parsed, None
+        logger.warning("Listing HTML parse returned no data for %s", ref)
+        return None, "parse_failed"
 
     def _fetch_page_hits(
         self,
@@ -1094,6 +1269,15 @@ class CentraleClient:
                 if item.get(key) is not None
             } or None
 
+        energy = vehicle.get("energy") or item.get("energy")
+        description_text = item.get("description") if include_description else None
+        ev_fields = extract_ev_metadata(
+            title=title,
+            version=version,
+            description=description_text,
+            energy=energy,
+        )
+
         return SearchResult(
             id=str(ref) if ref is not None else None,
             title=title,
@@ -1102,7 +1286,7 @@ class CentraleClient:
             version=version,
             year=self._int_value(vehicle.get("year") or item.get("year")),
             mileage=self._int_value(vehicle.get("mileage") or item.get("mileage")),
-            energy=vehicle.get("energy") or item.get("energy"),
+            energy=energy,
             gearbox=vehicle.get("gearbox") or item.get("gearbox"),
             price=self._float_value(item.get("price")),
             location=location,
@@ -1113,12 +1297,15 @@ class CentraleClient:
             good_deal_badge=item.get("goodDealBadge") or item.get("good_deal_badge"),
             url=url,
             image=item.get("photoUrl") or item.get("photo_url") if include_image else None,
-            description=item.get("description") if include_description else None,
+            description=description_text,
             features=item.get("features") if include_description else None,
             equipment=item.get("equipment") if include_description else None,
             technical_sheet_url=item.get("technical_sheet_url") if include_description else None,
             dealer=self._compact_customer(customer) if include_dealer else None,
             vehicle=vehicle if include_vehicle and vehicle else None,
+            battery_capacity_kwh=ev_fields.get("battery_capacity_kwh"),
+            charge_type=ev_fields.get("charge_type"),
+            battery_ownership=ev_fields.get("battery_ownership"),
             raw=hit if raw else None,
         )
 
@@ -1337,10 +1524,13 @@ class CentraleClient:
         return "auto"
 
     def _discover_listing_js_url(self) -> str:
+        return self._discover_listing_js_urls()[0]
+
+    def _discover_listing_js_urls(self) -> list[str]:
         with self._lock:
             if self._listing_js_url:
-                return self._listing_js_url
-        discovered: str | None = None
+                return [self._listing_js_url, LISTING_JS_FALLBACK]
+        discovered: list[str] = []
         try:
             html = self._request_text(
                 f"{CENTRALE_HOST}/listing",
@@ -1348,15 +1538,15 @@ class CentraleClient:
                 use_proxy=self.settings.centrale_www_use_proxy,
                 www=True,
             )
-            match = LISTING_JS_RE.search(html)
-            if match:
-                discovered = f"{CENTRALE_HOST}{match.group(0)}"
+            discovered = discover_listing_js_urls(html)
         except Exception as exc:
             logger.debug("listing JS discovery failed: %s", exc)
+        if not discovered:
+            discovered = [LISTING_JS_FALLBACK]
         with self._lock:
             if not self._listing_js_url:
-                self._listing_js_url = discovered or LISTING_JS_FALLBACK
-            return self._listing_js_url
+                self._listing_js_url = discovered[0]
+            return discovered
 
     def _get_distance_buckets(self) -> dict[int, str]:
         with self._lock:
@@ -1590,6 +1780,37 @@ class CentraleClient:
             self._json_cache[key] = (time.monotonic(), data)
 
     @staticmethod
+    def _listing_cache_key(ref: str, **flags: bool) -> str:
+        parts = [ref] + [f"{name}={int(value)}" for name, value in sorted(flags.items())]
+        return "listing:" + ":".join(parts)
+
+    def _cached_listing(self, key: str) -> dict[str, Any] | None:
+        ttl = max(0.0, float(self.settings.centrale_listing_cache_ttl))
+        if ttl <= 0:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            cached = self._listing_cache.get(key)
+            if not cached:
+                return None
+            cached_at, data = cached
+            if now - cached_at > ttl:
+                self._listing_cache.pop(key, None)
+                return None
+            return data
+
+    def _store_listing(self, key: str, data: dict[str, Any]) -> None:
+        max_entries = max(0, int(self.settings.centrale_listing_cache_max_entries))
+        ttl = max(0.0, float(self.settings.centrale_listing_cache_ttl))
+        if ttl <= 0 or max_entries <= 0:
+            return
+        with self._lock:
+            if len(self._listing_cache) >= max_entries:
+                oldest = min(self._listing_cache, key=lambda item: self._listing_cache[item][0])
+                self._listing_cache.pop(oldest, None)
+            self._listing_cache[key] = (time.monotonic(), data)
+
+    @staticmethod
     def _float_value(value: Any) -> float | None:
         try:
             return float(value) if value is not None else None
@@ -1607,11 +1828,44 @@ class CentraleClient:
 def extract_upstream_api_key(client: "CentraleClient") -> str:
     if client.settings.centrale_upstream_api_key:
         return client.settings.centrale_upstream_api_key
-    html = client._request_text(client._discover_listing_js_url(), json_accept=False, use_proxy=True)
-    match = API_KEY_RE.search(html)
-    if match:
-        return match.group(1)
-    raise CentraleError("Unable to extract CENTRALE_UPSTREAM_API_KEY from listing JS")
+
+    errors: list[str] = []
+    candidate_urls: list[str] = []
+    try:
+        listing_html = client._request_text(
+            f"{CENTRALE_HOST}/listing",
+            json_accept=False,
+            use_proxy=client.settings.centrale_www_use_proxy,
+            www=True,
+        )
+        candidate_urls.extend(discover_listing_js_urls(listing_html))
+    except Exception as exc:
+        errors.append(f"listing html: {exc}")
+
+    if not candidate_urls:
+        candidate_urls.extend(client._discover_listing_js_urls())
+
+    seen_urls: set[str] = set()
+    for js_url in candidate_urls:
+        if js_url in seen_urls:
+            continue
+        seen_urls.add(js_url)
+        try:
+            js_source = client._request_text(js_url, json_accept=False, use_proxy=True)
+            key = extract_api_key_from_js(js_source)
+            if key:
+                logger.info("Upstream API key discovered from %s", js_url)
+                return key
+        except Exception as exc:
+            errors.append(f"{js_url}: {exc}")
+
+    for fallback_key in (*client.settings.upstream_api_key_fallbacks(), *UPSTREAM_API_KEY_FALLBACKS):
+        if fallback_key:
+            logger.warning("Using configured fallback upstream API key")
+            return fallback_key
+
+    detail = "; ".join(errors) if errors else "no JS bundle matched"
+    raise CentraleError(f"Unable to extract CENTRALE_UPSTREAM_API_KEY from listing JS ({detail})")
 
 
 LISTING_JS_URL = LISTING_JS_FALLBACK

@@ -55,6 +55,22 @@ class Settings(BaseSettings):
     )
     centrale_cache_ttl: float = Field(default=20.0, validation_alias=AliasChoices("CENTRALE_CACHE_TTL"))
     centrale_cache_max_entries: int = Field(default=256, validation_alias=AliasChoices("CENTRALE_CACHE_MAX_ENTRIES"))
+    centrale_listing_cache_ttl: float = Field(
+        default=3600.0,
+        validation_alias=AliasChoices("CENTRALE_LISTING_CACHE_TTL"),
+    )
+    centrale_listing_cache_max_entries: int = Field(
+        default=128,
+        validation_alias=AliasChoices("CENTRALE_LISTING_CACHE_MAX_ENTRIES"),
+    )
+    centrale_listing_max_workers: int = Field(
+        default=4,
+        validation_alias=AliasChoices("CENTRALE_LISTING_MAX_WORKERS"),
+    )
+    centrale_upstream_api_key_fallbacks: str = Field(
+        default="",
+        validation_alias=AliasChoices("CENTRALE_UPSTREAM_API_KEY_FALLBACKS"),
+    )
     centrale_cookie_file: str = Field(
         default=str(PROJECT_ROOT / "data" / "cookies.json"),
         validation_alias=AliasChoices("CENTRALE_COOKIE_FILE"),
@@ -128,6 +144,15 @@ class Settings(BaseSettings):
     def impersonates(self) -> list[str]:
         values = [part.strip() for part in self.centrale_impersonates.split(",") if part.strip()]
         return values or ["chrome"]
+
+    def upstream_api_key_fallbacks(self) -> list[str]:
+        if not self.centrale_upstream_api_key_fallbacks:
+            return []
+        return [
+            part.strip()
+            for part in self.centrale_upstream_api_key_fallbacks.replace("\n", ",").split(",")
+            if part.strip()
+        ]
 
 
 @lru_cache
