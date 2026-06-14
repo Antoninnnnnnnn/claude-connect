@@ -1353,7 +1353,7 @@ class CentraleClient:
 
     def _api_params(self, **kwargs: Any) -> dict[str, str]:
         params: dict[str, str] = {
-            "page": str(kwargs.get("page") or 1),
+            "page": str(int(kwargs.get("page") or 1) - 1),
             "sortBy": SORT_PARAMS.get(str(kwargs.get("sort") or "newest").lower(), SORT_PARAMS["newest"]),
             "families": str(kwargs.get("families") or "AUTO,UTILITY"),
         }
@@ -1436,7 +1436,7 @@ class CentraleClient:
                 api_params["zipCodeDistance"] = site_params["distance"]
         if site_params.get("sortBy"):
             api_params["sortBy"] = site_params["sortBy"]
-        api_params["page"] = str(page)
+        api_params["page"] = str(page - 1)
         return api_params
 
     def _build_listing_url(self, *, page: int, **filter_kwargs: Any) -> str:
