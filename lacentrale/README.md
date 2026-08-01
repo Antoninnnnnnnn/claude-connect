@@ -8,6 +8,17 @@ Mini-API FastAPI qui expose la recherche automobile La Centrale en JSON compact 
 - **Fallback** : SSR `www.lacentrale.fr/listing?...` (si JSON indisponible)
 - **Detail** : `GET recherche.lacentrale.fr/v5/search?references={ref}` puis fallback HTML (Apollo / `CLASSIFIED_MAIN_INFOS` / `SummaryInformationData`, inspire de [ummhensi/lacentrale-scraper](https://github.com/ummhensi/lacentrale-scraper))
 - **Transport** : `curl_cffi` + proxy residentiel (meme pool que Vinted/Leboncoin)
+- **HTML www** : clearance DataDome mintee par camoufox headed (`app/mint_datadome.py`) puis rejouee par `curl_cffi` (`app/www_session.py`)
+
+### Venv navigateur (mint DataDome)
+
+```bash
+python3 -m venv ../.venv-browser
+../.venv-browser/bin/pip install camoufox[geoip]
+../.venv-browser/bin/python -m camoufox fetch
+sudo apt install -y xvfb   # le device check ne se resout qu'en mode headed
+```
+
 
 ## Reponse API
 
@@ -42,8 +53,25 @@ Variables utiles :
 | `CENTRALE_COOKIE_FILE` | `data/cookies.json` | cookies www (sans JWT) |
 | `CENTRALE_WWW_USE_PROXY` | `true` | proxy sur pages www |
 | `CENTRALE_WARMUP_ON_START` | `false` | warmup async au demarrage (desactive par defaut) |
-| `CENTRALE_IMPERSONATES` | `chrome,safari,...` | fingerprints TLS |
+| `CENTRALE_IMPERSONATES` | `chrome_android,chrome131_android` | fingerprints TLS (DataDome bloque les desktop sur l'API JSON) |
 | Pool partage | `VINTED_PROXY`, `LBC_PROXIES`, `DECODO_PROXY`, etc. | fallback proxies |
+
+Acces HTML `www.lacentrale.fr` (clearance DataDome mintee par navigateur, cf. `app/www_session.py`) :
+
+| Variable | Defaut | Role |
+|----------|--------|------|
+| `CENTRALE_BROWSER_ENABLED` | `true` | active le mint camoufox |
+| `CENTRALE_BROWSER_PYTHON` | `../.venv-browser/bin/python` | venv qui contient camoufox |
+| `CENTRALE_BROWSER_XVFB` | `true` | wrap `xvfb-run -a` (le device check ne se resout qu'en mode headed) |
+| `CENTRALE_BROWSER_PROXY` | `CENTRALE_PROXY` | exit residentiel FR pour le mint |
+| `CENTRALE_BROWSER_MINT_ATTEMPTS` | `4` | retries navigateur (nouvel IP a chaque essai) |
+| `CENTRALE_BROWSER_MINT_TIMEOUT` | `420` | timeout du subprocess de mint |
+| `CENTRALE_BROWSER_MINT_COOLDOWN` | `300` | pause apres un mint rate |
+| `CENTRALE_DATADOME_TOKEN_FILE` | `data/datadome_token.json` | persistance du cookie (gitignore, chmod 600) |
+| `CENTRALE_DATADOME_TOKEN_MAX_AGE` | `3600` | re-mint preventif |
+| `CENTRALE_WWW_MIN_INTERVAL` | `5` | espacement des fetch www (la clearance grille a ~1 req/s) |
+| `CENTRALE_WWW_IMPERSONATE` | `chrome` | fingerprint des fetch www |
+| `CENTRALE_WWW_FETCH_USE_PROXY` | `false` | le cookie est portable d'IP, pas besoin du proxy metre |
 
 Si `CENTRALE_UPSTREAM_API_KEY` est vide, la cle est extraite du bundle JS listing (decouverte dynamique du hash).
 
@@ -125,6 +153,7 @@ curl -sS -H "X-API-Key: $API_KEY" \
 
 - Proxy residentiel recommande (DataDome).
 - `distance_km=5` correspond au bucket UI → `200km` cote API (voir `/metadata`).
-- SSR fallback peut etre bloque depuis le VPS : preferer `CENTRALE_PRIMARY_STRATEGY=json`.
+- HTML www : DataDome exige une clearance mintee par navigateur (camoufox headed sous xvfb, ~25 s). Le premier appel a `include_description=true` ou a la strategie `ssr` paie ce mint, ensuite le cookie est reutilise. `CENTRALE_PRIMARY_STRATEGY=json` reste le defaut recommande (l'API JSON est plus rapide et sans mint).
+- `description` absente sur beaucoup d'annonces pro : la page renvoie `description: {}` ou `{"status":"REFUSED"}` — donnee vraiment absente, pas un blocage.
 - Les stats prix portent sur l'echantillon fetch, pas le marche entier.
 - Recherche sans resultat retourne `items: []` (pas d'erreur).

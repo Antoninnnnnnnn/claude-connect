@@ -93,6 +93,59 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("CENTRALE_WARMUP_ON_START"),
     )
 
+    # Browser-backed DataDome clearance for www.lacentrale.fr HTML (see www_session.py).
+    centrale_browser_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("CENTRALE_BROWSER_ENABLED"),
+    )
+    centrale_browser_python: str = Field(
+        default=str(WORKSPACE_ROOT / ".venv-browser" / "bin" / "python"),
+        validation_alias=AliasChoices("CENTRALE_BROWSER_PYTHON"),
+    )
+    centrale_browser_xvfb: bool = Field(
+        # The device check only auto-clears headed, so a headless host needs a virtual display.
+        default=True,
+        validation_alias=AliasChoices("CENTRALE_BROWSER_XVFB"),
+    )
+    centrale_browser_proxy: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("CENTRALE_BROWSER_PROXY"),
+    )
+    centrale_browser_mint_attempts: int = Field(
+        default=4,
+        validation_alias=AliasChoices("CENTRALE_BROWSER_MINT_ATTEMPTS"),
+    )
+    centrale_browser_mint_timeout: float = Field(
+        default=420.0,
+        validation_alias=AliasChoices("CENTRALE_BROWSER_MINT_TIMEOUT"),
+    )
+    centrale_browser_mint_cooldown: float = Field(
+        default=300.0,
+        validation_alias=AliasChoices("CENTRALE_BROWSER_MINT_COOLDOWN"),
+    )
+    centrale_datadome_token_file: str = Field(
+        default=str(PROJECT_ROOT / "data" / "datadome_token.json"),
+        validation_alias=AliasChoices("CENTRALE_DATADOME_TOKEN_FILE"),
+    )
+    centrale_datadome_token_max_age: float = Field(
+        default=3600.0,
+        validation_alias=AliasChoices("CENTRALE_DATADOME_TOKEN_MAX_AGE"),
+    )
+    centrale_www_min_interval: float = Field(
+        # Clearance survives 5s spacing indefinitely but burns at ~1 req/s.
+        default=5.0,
+        validation_alias=AliasChoices("CENTRALE_WWW_MIN_INTERVAL"),
+    )
+    centrale_www_impersonate: str = Field(
+        default="chrome",
+        validation_alias=AliasChoices("CENTRALE_WWW_IMPERSONATE"),
+    )
+    centrale_www_fetch_use_proxy: bool = Field(
+        # Clearance cookies are IP-portable, so HTML fetches skip the metered proxy.
+        default=False,
+        validation_alias=AliasChoices("CENTRALE_WWW_FETCH_USE_PROXY"),
+    )
+
     def max_fetchable_limit(self) -> int:
         return 24 * max(1, self.centrale_max_pages_per_search)
 
@@ -113,6 +166,7 @@ class Settings(BaseSettings):
         "dataimpulse_proxy",
         "evomi_proxy",
         "vinted_proxy",
+        "centrale_browser_proxy",
         mode="before",
     )
     @classmethod

@@ -16,6 +16,7 @@ from curl_cffi import requests
 
 from app.config import Settings
 from app.models import PriceStats, SearchResult
+from app.www_session import DatadomeUnavailable, WwwFetcher
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,8 @@ API_KEY_RE = re.compile(
 ZIP_DISTANCE_RE = re.compile(r'zipCodeDistance["\']?\s*[:=]\s*["\'](\d+km)["\']', re.I)
 CLASSIFIED_REF_RE = re.compile(r"classifieds/([A-Z]\d+)_", re.I)
 LISTING_REF_RE = re.compile(r"/auto-occasion-annonce-([A-Z]\d+)\.html", re.I)
+# Detail URLs encode the reference letter as its ASCII code: E119617689 -> 69119617689.
+LISTING_NUMERIC_REF_RE = re.compile(r"/auto-occasion-annonce-(6[5-9]|7\d|8\d|90)(\d+)\.html")
 LISTING_REF_PATTERN = re.compile(r"^[A-Z]\d+$", re.I)
 DETAIL_PRICE_RE = re.compile(r'"classifiedPrice"\s*:\s*(\d+)|"price"\s*:\s*(\d+)')
 SEARCH_CARD_HREF_RE = re.compile(
@@ -292,17 +295,15 @@ def extract_api_key_from_js(js_source: str) -> str | None:
 
 
 def parse_script_var_json(html: str, var_name: str) -> dict[str, Any] | None:
-    for prefix in (
-        f"var {var_name} = ",
-        f"const {var_name} = ",
-        f"let {var_name} = ",
-        f"window.{var_name} = ",
-    ):
-        index = html.find(prefix)
-        if index >= 0:
-            data = extract_json_object(html, index + len(prefix) - 1)
-            if data:
-                return data
+    # Live pages emit `var CLASSIFIED_MAIN_INFOS= {…}` (no space before `=`, one or
+    # more after), so match the assignment loosely instead of on fixed prefixes.
+    pattern = re.compile(
+        r"(?:(?:var|const|let)\s+|window\.)" + re.escape(var_name) + r"\s*=\s*(?=\{)"
+    )
+    for match in pattern.finditer(html):
+        data = extract_json_object(html, match.end() - 1)
+        if data:
+            return data
     return None
 
 
@@ -378,11 +379,28 @@ def classified_scripts_to_item(html: str, ref: str) -> dict[str, Any] | None:
             if feats:
                 item["features"] = " | ".join(feats)
 
-    summary = parse_script_var_json(html, "SummaryInformationData")
-    if isinstance(summary, dict):
-        seller_infos = summary.get("sellerInfos") if isinstance(summary.get("sellerInfos"), dict) else {}
-        if seller_infos.get("sellerName"):
-            item["customer"] = {"name": seller_infos.get("sellerName")}
+    # Seller data lives in CLASSIFIED_MORE_INFOS.data.sellerInfos now; SummaryInformationData
+    # no longer carries it, so keep it only as a fallback for older page variants.
+    seller_infos: dict[str, Any] = {}
+    more_infos = parse_script_var_json(html, "CLASSIFIED_MORE_INFOS")
+    if isinstance(more_infos, dict):
+        candidate = (more_infos.get("data") or {}).get("sellerInfos")
+        if isinstance(candidate, dict):
+            seller_infos = candidate
+    if not seller_infos:
+        summary = parse_script_var_json(html, "SummaryInformationData")
+        if isinstance(summary, dict) and isinstance(summary.get("sellerInfos"), dict):
+            seller_infos = summary["sellerInfos"]
+    if seller_infos:
+        customer = {
+            "name": seller_infos.get("sellerName"),
+            "is_pro": seller_infos.get("isPro"),
+            "pack": seller_infos.get("pack"),
+            "company_creation_date": seller_infos.get("companyCreationDate"),
+        }
+        customer = {key: value for key, value in customer.items() if value is not None}
+        if customer:
+            item["customer"] = customer
         address = seller_infos.get("address") if isinstance(seller_infos.get("address"), dict) else {}
         if address:
             item["location"] = {
@@ -392,6 +410,23 @@ def classified_scripts_to_item(html: str, ref: str) -> dict[str, Any] | None:
             }
 
     return item if len(item) > 1 else None
+
+
+def listing_url_for_ref(ref: str) -> str:
+    """Public detail URL for a reference.
+
+    The historical `...-E119617689.html` form now 404s: the live scheme replaces
+    the leading letter with its ASCII code (`E` -> `69`). The upstream JSON never
+    returns a url of its own, so every link goes through here.
+    """
+    clean = ref.strip().upper()
+    if LISTING_REF_PATTERN.match(clean):
+        return f"{CENTRALE_HOST}/auto-occasion-annonce-{ord(clean[0])}{clean[1:]}.html"
+    return f"{CENTRALE_HOST}/auto-occasion-annonce-{clean}.html"
+
+
+def extract_numeric_listing_refs(html: str) -> list[str]:
+    return [f"{chr(int(code))}{digits}" for code, digits in LISTING_NUMERIC_REF_RE.findall(html)]
 
 
 def extract_search_card_refs(html: str) -> list[str]:
@@ -405,7 +440,12 @@ def extract_search_card_refs(html: str) -> list[str]:
 
 def extract_listing_refs(html: str) -> list[str]:
     return sorted(
-        set(extract_search_card_refs(html) + CLASSIFIED_REF_RE.findall(html) + LISTING_REF_RE.findall(html))
+        set(
+            extract_search_card_refs(html)
+            + CLASSIFIED_REF_RE.findall(html)
+            + LISTING_REF_RE.findall(html)
+            + extract_numeric_listing_refs(html)
+        )
     )
 
 
@@ -425,6 +465,10 @@ class CentraleClient:
         self._listing_js_url: str | None = None
         self._upstream_api_key_cached: str | None = None
         self._prime_cache: tuple[str, float] | None = None
+        self._www_fetcher = WwwFetcher(
+            settings,
+            proxy_provider=self._next_proxy if settings.centrale_www_fetch_use_proxy else None,
+        )
         self._load_cookies()
 
     def bootstrap(self) -> None:
@@ -771,6 +815,7 @@ class CentraleClient:
             "upstream_api_key_configured": upstream_configured,
             "max_fetchable_limit": self.max_fetchable_limit(),
             "listing_js_url": self._listing_js_url or LISTING_JS_FALLBACK,
+            "www_browser": self._www_fetcher.status(),
         }
 
     def warmup(self) -> dict[str, Any]:
@@ -787,6 +832,7 @@ class CentraleClient:
             "status": response.status_code,
             "has_datadome": bool(self._datadome_client_id),
             "datadome_client_id": bool(self._datadome_client_id),
+            "www_browser": self._www_fetcher.status(),
         }
 
     def resolve_zip_distance(self, zip_code: str, distance_km: int | None = None) -> dict[str, Any]:
@@ -899,7 +945,7 @@ class CentraleClient:
         return item
 
     def _fetch_listing_html_enrichment(self, ref: str) -> tuple[dict[str, Any] | None, str | None]:
-        listing_url = f"{CENTRALE_HOST}/auto-occasion-annonce-{ref}.html"
+        listing_url = listing_url_for_ref(ref)
         try:
             response = self._session_request(
                 "GET",
@@ -1160,7 +1206,7 @@ class CentraleClient:
         refs = extract_listing_refs(html)
         if refs:
             return [
-                {"item": {"reference": ref, "url": f"{CENTRALE_HOST}/auto-occasion-annonce-{ref}.html"}}
+                {"item": {"reference": ref, "url": listing_url_for_ref(ref)}}
                 for ref in refs
             ]
         return []
@@ -1264,7 +1310,7 @@ class CentraleClient:
         version = vehicle.get("version") or vehicle.get("trimLevel") or item.get("version")
         title_parts = [part for part in [make, model, version] if part]
         title = item.get("title") or " ".join(str(part) for part in title_parts) or None
-        url = item.get("url") or (f"{CENTRALE_HOST}/auto-occasion-annonce-{ref}.html" if ref else None)
+        url = item.get("url") or (listing_url_for_ref(str(ref)) if ref else None)
         location = item.get("location") if isinstance(item.get("location"), dict) else None
         if not location:
             location = {
@@ -1613,6 +1659,14 @@ class CentraleClient:
     ) -> requests.Response:
         if method.upper() != "GET":
             raise CentraleError(f"Unsupported HTTP method: {method}")
+
+        if www and self._www_fetcher.available():
+            # www HTML is only reachable with browser-minted DataDome clearance.
+            try:
+                return self._www_fetcher.get(url, self._headers(json_accept=json_accept, api=api, www=True))
+            except DatadomeUnavailable as exc:
+                logger.warning("Browser-backed www fetch failed for %s: %s", url, exc)
+
         last_error = None
         for attempt in range(self.settings.centrale_max_retries + 1):
             self._throttle()

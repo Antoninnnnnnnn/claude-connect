@@ -6,6 +6,7 @@
 # Python virtual environments
 .venv/
 venv/
+.venv-browser/
 */.venv/
 */venv/
 
@@ -18,7 +19,11 @@ __pycache__/
 
 # Session cookies & runtime data
 */data/cookies.json
+*/data/datadome_token.json
 */data/server.pid
+
+# Stray cookie dumps from mangled path expansion
+*homeantoninclaude-connect*
 
 # EcoleDirecte security-question answers (personal)
 ecoledirecte/qcm.json
