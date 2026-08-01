@@ -767,7 +767,7 @@ class CentraleClient:
             "proxy_configured": proxy_count > 0,
             "proxy_count": proxy_count,
             "primary_strategy": self._primary_strategy(),
-            "datadome_configured": bool(self._www_cookies.get("datadome")),
+            "datadome_configured": bool(self._datadome_client_id),
             "upstream_api_key_configured": upstream_configured,
             "max_fetchable_limit": self.max_fetchable_limit(),
             "listing_js_url": self._listing_js_url or LISTING_JS_FALLBACK,
@@ -785,7 +785,7 @@ class CentraleClient:
         self._sync_cookies(response)
         return {
             "status": response.status_code,
-            "has_datadome": "datadome" in self._www_cookies,
+            "has_datadome": bool(self._datadome_client_id),
             "datadome_client_id": bool(self._datadome_client_id),
         }
 
@@ -902,6 +902,7 @@ class CentraleClient:
         listing_url = f"{CENTRALE_HOST}/auto-occasion-annonce-{ref}.html"
         try:
             response = self._session_request(
+                "GET",
                 listing_url,
                 json_accept=False,
                 use_proxy=self.settings.centrale_www_use_proxy,
@@ -959,8 +960,11 @@ class CentraleClient:
             if self._recherche_session is not None:
                 return self._recherche_session
         proxy = self._next_proxy()
-        session = requests.Session(impersonate="chrome")
+        session = requests.Session(impersonate=random.choice(self.settings.impersonates()))
         session.headers.update(self._headers(json_accept=True, api=True))
+        # Deliberately cookie-less: the search API answers 200 to a clean session but 403 as
+        # soon as a stale DataDome cookie is replayed, and www.lacentrale.fr never hands out a
+        # fresh one anymore (all its HTML is blocked).
         if proxy:
             session.proxies = {"http": proxy, "https": proxy}
         with self._lock:
@@ -1675,9 +1679,11 @@ class CentraleClient:
             for name, value in response.cookies.items():
                 if name in COOKIE_DENYLIST:
                     continue
+                if name == "datadome":
+                    # Kept in memory only: a replayed DataDome cookie is a guaranteed 403.
+                    self._datadome_client_id = value
+                    continue
                 self._www_cookies[name] = value
-            if self._www_cookies.get("datadome"):
-                self._datadome_client_id = self._www_cookies["datadome"]
             self._save_cookies_unlocked()
 
     @staticmethod
@@ -1738,10 +1744,8 @@ class CentraleClient:
                 self._www_cookies = {
                     str(key): str(value)
                     for key, value in data.items()
-                    if str(key) not in COOKIE_DENYLIST
+                    if str(key) not in COOKIE_DENYLIST and str(key) != "datadome"
                 }
-                if self._www_cookies.get("datadome"):
-                    self._datadome_client_id = self._www_cookies["datadome"]
 
     def _save_cookies_unlocked(self) -> None:
         if not self._www_cookies:

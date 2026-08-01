@@ -6,7 +6,8 @@
     },
     {
       "step": "warmup",
-      "ok": true
+      "ok": false,
+      "error": "Request failed after retries: blocked: HTTP 403"
     },
     {
       "step": "geoloc",
@@ -14,11 +15,12 @@
     },
     {
       "step": "aggregations",
-      "ok": true
+      "ok": false
     },
     {
       "step": "search_api",
-      "ok": true
+      "ok": false,
+      "error": "search API HTTP 403"
     },
     {
       "step": "ssr",
@@ -31,34 +33,29 @@
     },
     {
       "step": "client_search",
-      "ok": true
+      "ok": false,
+      "error": "page 1: json: search API HTTP 403"
     }
   ],
   "upstream_api_key_found": true,
-  "warmup": {
-    "status": 200,
-    "has_datadome": false,
-    "datadome_client_id": null
-  },
   "geoloc": {
-    "status": 200,
-    "body": {
+    "zip": "27000",
+    "distance_bucket": null,
+    "zip_code_distance": null,
+    "geoloc_status": 200,
+    "geoloc": {
       "zipcode": "27000",
       "lon": "1.14164412464",
       "lat": "49.02015421",
       "towns": [
         "EVREUX"
       ]
-    }
+    },
+    "status": 200
   },
   "aggregations": {
-    "status": 200,
-    "total": 24
-  },
-  "search_api": {
-    "status": 200,
-    "hits": 8,
-    "total": 24
+    "status": 400,
+    "total": null
   },
   "distance_buckets": {
     "0": "0km",
@@ -69,10 +66,5 @@
     "50": "50km",
     "100": "100km",
     "200": "200km"
-  },
-  "client_search": {
-    "items": 5,
-    "source": "json",
-    "total": 24
   }
 }

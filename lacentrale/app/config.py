@@ -42,7 +42,8 @@ class Settings(BaseSettings):
     centrale_min_interval: float = Field(default=1.5, validation_alias=AliasChoices("CENTRALE_MIN_INTERVAL"))
     centrale_max_retries: int = Field(default=3, validation_alias=AliasChoices("CENTRALE_MAX_RETRIES"))
     centrale_impersonates: str = Field(
-        default="chrome,safari,chrome_android",
+        # DataDome blocks desktop TLS/HTTP2 fingerprints since 2026-08; mobile ones pass.
+        default="chrome_android,chrome131_android",
         validation_alias=AliasChoices("CENTRALE_IMPERSONATES"),
     )
     centrale_rotate_proxy_per_request: bool = Field(
