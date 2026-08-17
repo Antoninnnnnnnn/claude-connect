@@ -1,3 +1,4 @@
+import logging
 import math
 import random
 import re
@@ -21,6 +22,8 @@ except Exception:  # pragma: no cover - the service can still run with numeric c
     lbc = None
     build_search_payload_with_url = None
 
+
+logger = logging.getLogger(__name__)
 
 LEBONCOIN_HOST = "https://www.leboncoin.fr"
 LBC_API_HOST = "https://api.leboncoin.fr"
@@ -417,30 +420,47 @@ class LeboncoinClient:
             try:
                 if needs_cookie:
                     self._prime_session(session)
+                started = time.monotonic()
                 response = session.request(method, url, json=payload, timeout=self.settings.lbc_timeout)
-                if response.status_code in {403, 429}:
-                    last_error = f"blocked or rate limited: HTTP {response.status_code}"
+                elapsed = time.monotonic() - started
+                if elapsed > self.settings.lbc_slow_session_seconds:
+                    # The session is pinned to one residential exit IP for its whole life, so a
+                    # slow answer means every later call would be slow too. Retire it and let the
+                    # next request draw a new IP; the current response is still usable.
+                    self._drop_session()
+                if response.status_code == 403:
+                    # A burnt residential exit IP, not a rate limit: the next connection gets a
+                    # different one, so reconnect immediately instead of backing off.
+                    last_error = "blocked: HTTP 403"
+                    self._drop_session()
+                elif response.status_code == 429:
+                    last_error = "rate limited: HTTP 429"
                     self._drop_session()
                     time.sleep(min(2**attempt, 8))
-                    continue
-                if response.status_code in {404, 410}:
+                elif response.status_code in {404, 410}:
                     raise LeboncoinError("Leboncoin resource not found")
-                if response.status_code >= 400:
+                elif response.status_code >= 400:
                     last_error = f"HTTP {response.status_code}"
                     time.sleep(min(2**attempt, 8))
-                    continue
-                try:
-                    return response.json()
-                except Exception as exc:
-                    last_error = f"invalid JSON response: {exc}"
-                    time.sleep(min(2**attempt, 8))
-                    continue
+                else:
+                    try:
+                        return response.json()
+                    except Exception as exc:
+                        last_error = f"invalid JSON response: {exc}"
+                        time.sleep(min(2**attempt, 8))
             except LeboncoinError:
                 raise
             except Exception as exc:
-                last_error = str(exc)
+                # Usually a tarpitted exit IP timing out; a fresh connection re-rolls it.
+                last_error = f"{type(exc).__name__}: {exc}"
                 self._drop_session()
-                time.sleep(min(2**attempt, 8))
+            logger.warning(
+                "leboncoin attempt %s/%s failed via %s: %s",
+                attempt + 1,
+                self.settings.lbc_max_retries + 1,
+                "proxy" if proxy else "direct",
+                last_error,
+            )
         raise LeboncoinError(f"Leboncoin request failed after retries: {last_error}")
 
     def _throttle(self) -> None:
@@ -452,11 +472,15 @@ class LeboncoinClient:
             self._last_request = time.monotonic()
 
     def _proxy_candidates(self) -> list[str | None]:
-        # Direct (no-proxy) access from this server's own IP passes DataDome's
-        # fingerprint check cleanly; the residential proxy pool is kept only as a
-        # fallback since its exit IPs are frequently bandwidth-throttled/tarpitted.
-        candidates: list[str | None] = [None]
-        candidates.extend(self.settings.proxy_urls())
+        # Always route through the residential pool: it keeps the server's own IP out of
+        # DataDome's reputation table. Some exit IPs are burnt (403) or bandwidth-throttled,
+        # hence the retry loop walking the pool. Direct access is only used when no proxy is
+        # configured at all, or when LBC_ALLOW_DIRECT_FALLBACK is enabled as a last resort.
+        candidates: list[str | None] = list(self.settings.proxy_urls())
+        if not candidates:
+            return [None]
+        if self.settings.lbc_allow_direct_fallback:
+            candidates.append(None)
         return candidates
 
     @staticmethod

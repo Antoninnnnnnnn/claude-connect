@@ -12,7 +12,8 @@ Points importants :
 
 - **Empreinte mobile obligatoire** : DataDome renvoie 403 aux profils TLS desktop. `LBC_IMPERSONATES` doit rester sur des profils mobiles (`safari_ios`, `chrome_android`, `firefox`).
 - **Cookie DataDome** : l'endpoint recherche refuse (403) une session porteuse d'un cookie DataDome, l'endpoint annonce l'exige. Le client ne prime donc la session que pour `/ad/{id}`, via un POST `finder/search` a 1 resultat (~8 KB) au lieu de la page d'accueil (~400 KB).
-- **Proxy optionnel** : l'acces direct depuis l'IP du serveur passe la verification DataDome. Les proxys residentiels ne servent plus que de fallback (leurs IP de sortie sont souvent bridees a quelques KB/s).
+- **Proxy toujours utilise** : tout le trafic passe par le pool residentiel, l'IP du serveur n'est jamais exposee. Environ une IP de sortie sur trois est brulee (403 instantane, 446 B) ou bridee a quelques KB/s ; le client abandonne vite (`LBC_TIMEOUT=12`) et reessaie sur une nouvelle connexion, donc une nouvelle IP. Mettre `LBC_ALLOW_DIRECT_FALLBACK=true` pour autoriser un repli en direct quand le pool echoue.
+- **Sessions bridees retirees** : une reponse plus lente que `LBC_SLOW_SESSION_SECONDS` retire la session, sinon toute sa duree de vie resterait collee a une IP lente.
 - **Sessions chaudes** : la session curl_cffi et son cookie sont reutilises pendant `LBC_SESSION_TTL` secondes, ce qui amortit le priming a ~0.
 
 ## Configuration
@@ -27,15 +28,17 @@ Variables utiles :
 
 - `API_KEY` : cle attendue dans le header `X-API-Key`.
 - `LBC_PORT` : port d'ecoute, defaut `8092`.
-- `LBC_PROXY` : proxy HTTP(S) residentiel unique (optionnel, fallback uniquement).
+- `LBC_PROXY` : proxy HTTP(S) residentiel unique (requis : sans proxy configure, le client sort en direct).
 - `LBC_PROXIES` : plusieurs proxys separes par virgule ou point-virgule.
 - `DECODO_PROXY`, `DATAIMPULSE_PROXY`, `EVOMI_PROXY` : proxys dedies possibles.
 - `VINTED_PROXY` : fallback si aucun proxy Leboncoin dedie n'est defini.
 - `LBC_IMPERSONATES` : empreintes TLS, defaut `safari_ios,chrome_android,firefox` (garder du mobile).
 - `LBC_SESSION_TTL` : duree de reutilisation d'une session chaude, defaut `600` secondes.
 - `LBC_MIN_INTERVAL` : delai minimal entre deux appels Leboncoin, defaut `1.5`.
-- `LBC_MAX_RETRIES` : retries par page, defaut `3`.
-- `LBC_TIMEOUT` : timeout par appel, defaut `45`.
+- `LBC_MAX_RETRIES` : retries par page, defaut `6` (absorbe les IP de sortie brulees).
+- `LBC_TIMEOUT` : timeout par appel, defaut `12` (court exprès, voir plus haut).
+- `LBC_SLOW_SESSION_SECONDS` : au-dela, la session est retiree, defaut `4`.
+- `LBC_ALLOW_DIRECT_FALLBACK` : autorise la sortie directe si le pool echoue, defaut `false`.
 - `LBC_CACHE_TTL` : cache court du JSON Leboncoin par URL, defaut `20` secondes.
 - `LBC_CACHE_MAX_ENTRIES` : taille max du cache court, defaut `256`.
 

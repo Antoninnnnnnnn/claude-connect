@@ -27,13 +27,20 @@ class Settings(BaseSettings):
     evomi_proxy: str | None = Field(default=None, validation_alias=AliasChoices("EVOMI_PROXY"))
     vinted_proxy: str | None = Field(default=None, validation_alias=AliasChoices("VINTED_PROXY"))
 
-    lbc_timeout: float = Field(default=45.0, validation_alias=AliasChoices("LBC_TIMEOUT"))
+    # Short on purpose: a tarpitted residential exit IP trickles at a few KB/s, so it is
+    # cheaper to abandon it and reconnect (new exit IP) than to wait it out.
+    lbc_timeout: float = Field(default=12.0, validation_alias=AliasChoices("LBC_TIMEOUT"))
     lbc_min_interval: float = Field(default=1.5, validation_alias=AliasChoices("LBC_MIN_INTERVAL"))
-    lbc_max_retries: int = Field(default=3, validation_alias=AliasChoices("LBC_MAX_RETRIES"))
+    lbc_max_retries: int = Field(default=6, validation_alias=AliasChoices("LBC_MAX_RETRIES"))
     # The mobile JSON API expects a mobile-app client: desktop TLS fingerprints get 403'd.
     lbc_impersonates: str = Field(default="safari_ios,chrome_android,firefox", validation_alias=AliasChoices("LBC_IMPERSONATES"))
     lbc_rotate_proxy_per_request: bool = Field(default=True, validation_alias=AliasChoices("LBC_ROTATE_PROXY_PER_REQUEST"))
     lbc_max_pages_per_search: int = Field(default=3, validation_alias=AliasChoices("LBC_MAX_PAGES_PER_SEARCH"))
+    # Requests always go through the proxy pool; set this to true to let a failing pool fall
+    # back on the server's own IP instead of erroring out.
+    lbc_allow_direct_fallback: bool = Field(default=False, validation_alias=AliasChoices("LBC_ALLOW_DIRECT_FALLBACK"))
+    # A response slower than this retires the session: its exit IP is throttled.
+    lbc_slow_session_seconds: float = Field(default=4.0, validation_alias=AliasChoices("LBC_SLOW_SESSION_SECONDS"))
     lbc_session_ttl: float = Field(default=600.0, validation_alias=AliasChoices("LBC_SESSION_TTL"))
     lbc_cache_ttl: float = Field(default=20.0, validation_alias=AliasChoices("LBC_CACHE_TTL"))
     lbc_cache_max_entries: int = Field(default=256, validation_alias=AliasChoices("LBC_CACHE_MAX_ENTRIES"))
