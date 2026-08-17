@@ -1,4 +1,3 @@
-import json
 import math
 import random
 import re
@@ -6,8 +5,9 @@ import statistics
 import threading
 import time
 import unicodedata
+import uuid
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote_plus, urlencode, urlparse, urlunparse
 
 from curl_cffi import requests
 
@@ -16,15 +16,16 @@ from app.models import PriceStats, SearchResult
 
 try:
     import lbc
+    from lbc.utils import build_search_payload_with_url
 except Exception:  # pragma: no cover - the service can still run with numeric categories.
     lbc = None
+    build_search_payload_with_url = None
 
 
 LEBONCOIN_HOST = "https://www.leboncoin.fr"
-NEXT_DATA_RE = re.compile(
-    r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
-    re.DOTALL,
-)
+LBC_API_HOST = "https://api.leboncoin.fr"
+SEARCH_ENDPOINT = f"{LBC_API_HOST}/finder/search"
+AD_ENDPOINT = f"{LBC_API_HOST}/api/adfinder/v1/classified/{{ad_id}}"
 FRONTEND_PAGE_SIZE = 35
 
 CATEGORY_ALIASES = {
@@ -74,6 +75,9 @@ class LeboncoinClient:
         self._proxy_index = 0
         self._url_cache: dict[str, str] = {}
         self._next_data_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._session: Any = None
+        self._session_proxy: str | None = None
+        self._session_born = 0.0
 
     def search(
         self,
@@ -122,10 +126,10 @@ class LeboncoinClient:
                 url=url,
             )
             try:
-                next_data = self._fetch_next_data(search_url)
-                search_data = next_data.get("props", {}).get("pageProps", {}).get("searchData", {})
+                page_size = max(1, min(limit - len(ads), FRONTEND_PAGE_SIZE))
+                search_data = self._fetch_search_json(search_url, page_number, page_size)
                 if not isinstance(search_data, dict):
-                    raise LeboncoinError("Leboncoin page does not contain searchData")
+                    raise LeboncoinError("Leboncoin API did not return search data")
                 page_ads = search_data.get("ads") or []
                 if not isinstance(page_ads, list):
                     raise LeboncoinError("Leboncoin searchData.ads is not a list")
@@ -177,7 +181,7 @@ class LeboncoinClient:
             },
         }
         if debug:
-            data["source"] = "next_data"
+            data["source"] = "finder_api"
         if failures:
             data["failures"] = failures
         return data
@@ -196,11 +200,9 @@ class LeboncoinClient:
         raw: bool = False,
     ) -> dict[str, Any]:
         clean_id = str(ad_id).strip()
-        url = self._url_cache.get(clean_id) or f"{LEBONCOIN_HOST}/vi/{clean_id}.htm"
-        next_data = self._fetch_next_data(url)
-        ad = next_data.get("props", {}).get("pageProps", {}).get("ad")
+        ad = self._fetch_ad_json(clean_id)
         if not isinstance(ad, dict):
-            raise LeboncoinError(f"Unable to find ad {clean_id} in Leboncoin page data")
+            raise LeboncoinError(f"Unable to find ad {clean_id} in Leboncoin API data")
         normalized = self._normalize_ad(
             ad,
             include_image=include_image,
@@ -213,7 +215,7 @@ class LeboncoinClient:
         ).model_dump(exclude_none=True)
         data: dict[str, Any] = {"item": normalized}
         if debug:
-            data.update({"source": "next_data", "details_available": True})
+            data.update({"source": "finder_api", "details_available": True})
         return data
 
     def price_stats(self, **kwargs: Any) -> PriceStats:
@@ -261,79 +263,184 @@ class LeboncoinClient:
             ],
         }
 
-    def _fetch_next_data(self, url: str) -> dict[str, Any]:
-        cached = self._cached_next_data(url)
+    def _fetch_search_json(self, search_url: str, page_number: int, page_size: int = FRONTEND_PAGE_SIZE) -> dict[str, Any]:
+        page_size = max(1, min(int(page_size), FRONTEND_PAGE_SIZE))
+        cache_key = f"{search_url}|{page_size}"
+        cached = self._cached_json(cache_key)
         if cached is not None:
             return cached
-        html = self._request_html(url)
-        match = NEXT_DATA_RE.search(html)
-        if not match:
-            if self._looks_blocked(html):
-                raise LeboncoinError("Leboncoin returned a DataDome/captcha page")
-            raise LeboncoinError("Leboncoin page does not contain __NEXT_DATA__")
-        try:
-            next_data = json.loads(match.group(1))
-        except json.JSONDecodeError as exc:
-            raise LeboncoinError(f"Unable to parse __NEXT_DATA__: {exc}") from exc
-        self._store_next_data(url, next_data)
-        return next_data
+        if build_search_payload_with_url is None:
+            raise LeboncoinError("lbc package is not available to build search payloads")
+        payload = build_search_payload_with_url(url=search_url, limit=page_size, page=page_number)
+        self._sanitize_payload(payload)
+        # Keep the web page semantics (a page is always FRONTEND_PAGE_SIZE ads wide) while
+        # only downloading the ads we actually return: saves proxy bandwidth on small limits.
+        payload["offset"] = FRONTEND_PAGE_SIZE * (page_number - 1)
+        payload["limit_alu"] = 0  # drop sponsored "a la une" ads, they are never returned
+        payload["disable_total"] = False
+        payload.setdefault("filters", {}).setdefault("enums", {}).setdefault("ad_type", ["offer"])
+        data = self._request_json("POST", SEARCH_ENDPOINT, payload=payload)
+        self._store_json(cache_key, data)
+        return data
 
-    def _cached_next_data(self, url: str) -> dict[str, Any] | None:
+    @staticmethod
+    def _sanitize_payload(payload: dict[str, Any]) -> None:
+        """Work around two bugs in lbc.utils.build_search_payload_with_url.
+
+        It never percent-decodes query values (so `text=nike+tn` is searched literally), and
+        its `page` guard tests the value instead of the key, turning `&page=2` into a bogus
+        `filters.enums.page` that makes the API return zero ads.
+        """
+        filters = payload.get("filters")
+        if not isinstance(filters, dict):
+            return
+        enums = filters.get("enums")
+        if isinstance(enums, dict):
+            enums.pop("page", None)
+            for key, values in list(enums.items()):
+                if isinstance(values, list):
+                    enums[key] = [unquote_plus(str(value)) for value in values]
+            if not enums:
+                filters.pop("enums", None)
+        keywords = filters.get("keywords")
+        if isinstance(keywords, dict) and isinstance(keywords.get("text"), str):
+            keywords["text"] = unquote_plus(keywords["text"])
+
+    def _fetch_ad_json(self, ad_id: str) -> dict[str, Any]:
+        cache_key = f"ad:{ad_id}"
+        cached = self._cached_json(cache_key)
+        if cached is not None:
+            return cached
+        data = self._request_json("GET", AD_ENDPOINT.format(ad_id=ad_id), needs_cookie=True)
+        self._store_json(cache_key, data)
+        return data
+
+    def _cached_json(self, key: str) -> dict[str, Any] | None:
         ttl = max(0.0, float(self.settings.lbc_cache_ttl))
         if ttl <= 0:
             return None
         now = time.monotonic()
         with self._lock:
-            cached = self._next_data_cache.get(url)
+            cached = self._next_data_cache.get(key)
             if not cached:
                 return None
             cached_at, data = cached
             if now - cached_at > ttl:
-                self._next_data_cache.pop(url, None)
+                self._next_data_cache.pop(key, None)
                 return None
             return data
 
-    def _store_next_data(self, url: str, data: dict[str, Any]) -> None:
+    def _store_json(self, key: str, data: dict[str, Any]) -> None:
         max_entries = max(0, int(self.settings.lbc_cache_max_entries))
         if self.settings.lbc_cache_ttl <= 0 or max_entries <= 0:
             return
         with self._lock:
             if len(self._next_data_cache) >= max_entries:
-                oldest_url = min(self._next_data_cache, key=lambda key: self._next_data_cache[key][0])
-                self._next_data_cache.pop(oldest_url, None)
-            self._next_data_cache[url] = (time.monotonic(), data)
+                oldest_key = min(self._next_data_cache, key=lambda key: self._next_data_cache[key][0])
+                self._next_data_cache.pop(oldest_key, None)
+            self._next_data_cache[key] = (time.monotonic(), data)
 
-    def _request_html(self, url: str) -> str:
+    def _new_session(self, proxy: str | None) -> Any:
+        impersonate = random.choice(self.settings.impersonates())
+        session = requests.Session(impersonate=impersonate)
+        session.headers.update(self._headers(impersonate))
+        if proxy:
+            session.proxies = {"http": proxy, "https": proxy}
+        return session
+
+    def _acquire_session(self, proxy: str | None) -> Any:
+        """Reuse a warm session (and its DataDome cookie) instead of re-handshaking every call.
+
+        Keeping the cookie jar alive is the main bandwidth saver: a fresh session has to be
+        primed before the ad endpoint accepts it, and each prime costs an extra round trip.
+        """
+        ttl = max(0.0, float(self.settings.lbc_session_ttl))
+        with self._lock:
+            fresh_enough = ttl > 0 and (time.monotonic() - self._session_born) < ttl
+            if self._session is not None and self._session_proxy == proxy and fresh_enough:
+                return self._session
+            self._drop_session_locked()
+            self._session = self._new_session(proxy)
+            self._session_proxy = proxy
+            self._session_born = time.monotonic()
+            return self._session
+
+    def _drop_session_locked(self) -> None:
+        if self._session is not None:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+        self._session = None
+        self._session_proxy = None
+        self._session_born = 0.0
+
+    def _drop_session(self) -> None:
+        with self._lock:
+            self._drop_session_locked()
+
+    def _prime_session(self, session: Any) -> None:
+        """Mint a DataDome cookie with the cheapest request that produces one.
+
+        The homepage works but weighs ~400KB; a 1-result search POST is ~8KB and mints the
+        same cookie, so we use that instead.
+        """
+        if session.cookies.get("datadome"):
+            return
+        session.post(
+            SEARCH_ENDPOINT,
+            json={
+                "filters": {},
+                "limit": 1,
+                "limit_alu": 0,
+                "offset": 0,
+                "disable_total": True,
+                "extend": False,
+                "listing_source": "direct-search",
+            },
+            timeout=self.settings.lbc_timeout,
+        )
+
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        payload: dict[str, Any] | None = None,
+        needs_cookie: bool = False,
+    ) -> dict[str, Any]:
         last_error = None
+        candidates = self._proxy_candidates()
         for attempt in range(self.settings.lbc_max_retries + 1):
             self._throttle()
-            proxy = self._next_proxy()
-            impersonate = random.choice(self.settings.impersonates())
-            session = requests.Session(impersonate=impersonate)
-            session.headers.update(self._headers())
-            if proxy:
-                session.proxies = {"http": proxy, "https": proxy}
+            proxy = candidates[attempt % len(candidates)]
+            session = self._acquire_session(proxy)
             try:
-                response = session.get(url, timeout=self.settings.lbc_timeout, allow_redirects=True)
-                body = response.text
-                if response.status_code in {403, 429} or self._looks_blocked(body):
+                if needs_cookie:
+                    self._prime_session(session)
+                response = session.request(method, url, json=payload, timeout=self.settings.lbc_timeout)
+                if response.status_code in {403, 429}:
                     last_error = f"blocked or rate limited: HTTP {response.status_code}"
+                    self._drop_session()
                     time.sleep(min(2**attempt, 8))
                     continue
-                if response.status_code == 404:
-                    raise LeboncoinError("Leboncoin page not found")
+                if response.status_code in {404, 410}:
+                    raise LeboncoinError("Leboncoin resource not found")
                 if response.status_code >= 400:
                     last_error = f"HTTP {response.status_code}"
                     time.sleep(min(2**attempt, 8))
                     continue
-                return body
+                try:
+                    return response.json()
+                except Exception as exc:
+                    last_error = f"invalid JSON response: {exc}"
+                    time.sleep(min(2**attempt, 8))
+                    continue
             except LeboncoinError:
                 raise
             except Exception as exc:
                 last_error = str(exc)
+                self._drop_session()
                 time.sleep(min(2**attempt, 8))
-            finally:
-                session.close()
         raise LeboncoinError(f"Leboncoin request failed after retries: {last_error}")
 
     def _throttle(self) -> None:
@@ -344,32 +451,35 @@ class LeboncoinClient:
                 time.sleep(wait_for)
             self._last_request = time.monotonic()
 
-    def _next_proxy(self) -> str | None:
-        proxies = self.settings.proxy_urls()
-        if not proxies:
-            return None
-        with self._lock:
-            if self.settings.lbc_rotate_proxy_per_request:
-                proxy = proxies[self._proxy_index % len(proxies)]
-                self._proxy_index += 1
-                return proxy
-            return proxies[0]
+    def _proxy_candidates(self) -> list[str | None]:
+        # Direct (no-proxy) access from this server's own IP passes DataDome's
+        # fingerprint check cleanly; the residential proxy pool is kept only as a
+        # fallback since its exit IPs are frequently bandwidth-throttled/tarpitted.
+        candidates: list[str | None] = [None]
+        candidates.extend(self.settings.proxy_urls())
+        return candidates
 
     @staticmethod
-    def _headers() -> dict[str, str]:
+    def _headers(impersonate: str = "safari_ios") -> dict[str, str]:
         return {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "User-Agent": LeboncoinClient._mobile_user_agent(impersonate),
+            "Accept": "application/json",
             "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Referer": f"{LEBONCOIN_HOST}/",
-            "Upgrade-Insecure-Requests": "1",
+            "Content-Type": "application/json",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
         }
 
     @staticmethod
-    def _looks_blocked(body: str) -> bool:
-        lower = body[:20000].lower()
-        return "captcha-delivery.com" in lower or ("datadome" in lower and "__next_data__" not in lower)
+    def _mobile_user_agent(impersonate: str = "safari_ios") -> str:
+        # Keep the announced OS consistent with the TLS fingerprint we impersonate.
+        if "ios" in impersonate or impersonate.startswith("safari"):
+            os_version = random.choice(["18.4", "18.5", "18.6", "26.0", "26.1"])
+            return f"LBC;iOS;{os_version};iPhone;phone;{uuid.uuid4()};wifi;101.44.0"
+        os_version = random.choice(["12", "13", "14", "15"])
+        model = random.choice(["Pixel 7", "Pixel 8", "SM-S918B", "SM-A546B"])
+        return f"LBC;Android;{os_version};{model};phone;{uuid.uuid4().hex[:16]};wifi;100.85.2"
 
     def _build_search_url(
         self,

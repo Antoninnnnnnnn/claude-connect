@@ -2,7 +2,18 @@
 
 Mini-API FastAPI qui expose la recherche publique Leboncoin en JSON.
 
-La strategie principale lit le JSON `__NEXT_DATA__` des pages publiques Leboncoin. Le client `lbc` de base a ete conserve comme reference, mais les endpoints API Leboncoin directs sont souvent bloques par DataDome sur ce VPS.
+La strategie principale interroge l'API JSON officielle de l'app mobile :
+`POST https://api.leboncoin.fr/finder/search` pour la recherche et
+`GET https://api.leboncoin.fr/api/adfinder/v1/classified/{id}` pour une annonce.
+Le scraping de `__NEXT_DATA__` sur les pages HTML a ete abandonne (une page pesait ~400 KB
+pour le meme resultat).
+
+Points importants :
+
+- **Empreinte mobile obligatoire** : DataDome renvoie 403 aux profils TLS desktop. `LBC_IMPERSONATES` doit rester sur des profils mobiles (`safari_ios`, `chrome_android`, `firefox`).
+- **Cookie DataDome** : l'endpoint recherche refuse (403) une session porteuse d'un cookie DataDome, l'endpoint annonce l'exige. Le client ne prime donc la session que pour `/ad/{id}`, via un POST `finder/search` a 1 resultat (~8 KB) au lieu de la page d'accueil (~400 KB).
+- **Proxy optionnel** : l'acces direct depuis l'IP du serveur passe la verification DataDome. Les proxys residentiels ne servent plus que de fallback (leurs IP de sortie sont souvent bridees a quelques KB/s).
+- **Sessions chaudes** : la session curl_cffi et son cookie sont reutilises pendant `LBC_SESSION_TTL` secondes, ce qui amortit le priming a ~0.
 
 ## Configuration
 
@@ -16,10 +27,12 @@ Variables utiles :
 
 - `API_KEY` : cle attendue dans le header `X-API-Key`.
 - `LBC_PORT` : port d'ecoute, defaut `8092`.
-- `LBC_PROXY` : proxy HTTP(S) residentiel unique.
+- `LBC_PROXY` : proxy HTTP(S) residentiel unique (optionnel, fallback uniquement).
 - `LBC_PROXIES` : plusieurs proxys separes par virgule ou point-virgule.
 - `DECODO_PROXY`, `DATAIMPULSE_PROXY`, `EVOMI_PROXY` : proxys dedies possibles.
 - `VINTED_PROXY` : fallback si aucun proxy Leboncoin dedie n'est defini.
+- `LBC_IMPERSONATES` : empreintes TLS, defaut `safari_ios,chrome_android,firefox` (garder du mobile).
+- `LBC_SESSION_TTL` : duree de reutilisation d'une session chaude, defaut `600` secondes.
 - `LBC_MIN_INTERVAL` : delai minimal entre deux appels Leboncoin, defaut `1.5`.
 - `LBC_MAX_RETRIES` : retries par page, defaut `3`.
 - `LBC_TIMEOUT` : timeout par appel, defaut `45`.

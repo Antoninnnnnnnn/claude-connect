@@ -30,9 +30,11 @@ class Settings(BaseSettings):
     lbc_timeout: float = Field(default=45.0, validation_alias=AliasChoices("LBC_TIMEOUT"))
     lbc_min_interval: float = Field(default=1.5, validation_alias=AliasChoices("LBC_MIN_INTERVAL"))
     lbc_max_retries: int = Field(default=3, validation_alias=AliasChoices("LBC_MAX_RETRIES"))
-    lbc_impersonates: str = Field(default="chrome,safari,chrome_android", validation_alias=AliasChoices("LBC_IMPERSONATES"))
+    # The mobile JSON API expects a mobile-app client: desktop TLS fingerprints get 403'd.
+    lbc_impersonates: str = Field(default="safari_ios,chrome_android,firefox", validation_alias=AliasChoices("LBC_IMPERSONATES"))
     lbc_rotate_proxy_per_request: bool = Field(default=True, validation_alias=AliasChoices("LBC_ROTATE_PROXY_PER_REQUEST"))
     lbc_max_pages_per_search: int = Field(default=3, validation_alias=AliasChoices("LBC_MAX_PAGES_PER_SEARCH"))
+    lbc_session_ttl: float = Field(default=600.0, validation_alias=AliasChoices("LBC_SESSION_TTL"))
     lbc_cache_ttl: float = Field(default=20.0, validation_alias=AliasChoices("LBC_CACHE_TTL"))
     lbc_cache_max_entries: int = Field(default=256, validation_alias=AliasChoices("LBC_CACHE_MAX_ENTRIES"))
 
