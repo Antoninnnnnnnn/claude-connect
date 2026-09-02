@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import html as html_lib
 import json
+import logging
 import re
 import statistics
 import time
@@ -10,6 +12,9 @@ import httpx
 
 from app.config import Settings
 from app.models import PriceStats, SearchResult
+
+
+logger = logging.getLogger(__name__)
 
 
 DOMAIN_HOSTS = {
@@ -49,7 +54,19 @@ class VintedClient:
         self._client: httpx.AsyncClient | None = None
         self._lock = asyncio.Lock()
         self._last_request = 0.0
-        self._item_cache: dict[int, dict[str, Any]] = {}
+        self._cookie_fingerprint: str | None = None
+        self._session_refreshes = 0
+        self._last_error: str | None = None
+
+    def health_status(self) -> dict[str, Any]:
+        return {
+            "status": "up",
+            "started": self._client is not None,
+            "proxy_configured": bool(self.settings.vinted_proxy),
+            "has_session_cookies": bool(self._cookie_fingerprint),
+            "session_refreshes": self._session_refreshes,
+            "last_error": self._last_error,
+        }
 
     async def start(self) -> None:
         self.settings.cookie_file.parent.mkdir(parents=True, exist_ok=True)
@@ -101,19 +118,34 @@ class VintedClient:
             return
 
     def _save_cookies(self) -> None:
+        """Persist the cookie jar, but only when it actually changed.
+
+        This used to run on every successful request, rewriting the same bytes to
+        disk dozens of times per search.
+        """
         if not self._client:
             return
-        cookies = []
-        for cookie in self._client.cookies.jar:
-            cookies.append(
-                {
-                    "name": cookie.name,
-                    "value": cookie.value,
-                    "domain": cookie.domain,
-                    "path": cookie.path,
-                }
-            )
-        self.settings.cookie_file.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+        cookies = [
+            {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain,
+                "path": cookie.path,
+            }
+            for cookie in self._client.cookies.jar
+        ]
+        payload = json.dumps(cookies, indent=2)
+        fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if fingerprint == self._cookie_fingerprint:
+            return
+        try:
+            self.settings.cookie_file.parent.mkdir(parents=True, exist_ok=True)
+            self.settings.cookie_file.write_text(payload, encoding="utf-8")
+            self.settings.cookie_file.chmod(0o600)
+        except OSError as exc:
+            logger.warning("Could not persist Vinted cookies: %s", exc)
+            return
+        self._cookie_fingerprint = fingerprint
 
     async def refresh_session(self, domain: str | None = None) -> None:
         if not self._client:
@@ -127,7 +159,10 @@ class VintedClient:
             },
         )
         if response.status_code >= 400:
+            self._last_error = f"session refresh HTTP {response.status_code}"
             raise VintedError(f"Vinted session refresh failed: HTTP {response.status_code}")
+        self._session_refreshes += 1
+        self._last_error = None
         self._save_cookies()
 
     async def _throttle(self) -> None:
@@ -245,10 +280,6 @@ class VintedClient:
 
         payload = await self._request(domain, "/api/v2/catalog/items", params=params)
         items = payload.get("items") or []
-        for item in items:
-            item_id = item.get("id")
-            if isinstance(item_id, int):
-                self._item_cache[item_id] = item
         return {
             "items": [
                 self._normalize_item(

@@ -75,7 +75,14 @@ def mint(proxy: dict[str, str] | None, attempts: int) -> dict[str, object]:
                     "minted_at": time.time(),
                 }
         except Exception as exc:  # noqa: BLE001 - report and retry with a new exit IP
-            errors.append(f"attempt {attempt}: {exc.__class__.__name__}: {exc}")
+            detail = f"{exc.__class__.__name__}: {exc}"
+            errors.append(f"attempt {attempt}: {detail}")
+            if "NotInstalled" in exc.__class__.__name__ or "camoufox fetch" in str(exc):
+                # The browser binary is missing: retrying cannot help, and each retry
+                # costs a full launch timeout. Fail immediately with the fix to apply.
+                raise RuntimeError(
+                    f"{detail} — run: .venv-browser/bin/python -m camoufox fetch"
+                ) from None
     raise RuntimeError("; ".join(errors) or "mint failed")
 
 

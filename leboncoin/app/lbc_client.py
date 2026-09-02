@@ -74,9 +74,11 @@ class LeboncoinClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._lock = threading.Lock()
+        # Pacing gets its own lock: `_lock` guards the caches and the shared session,
+        # and a cache hit must not queue behind another request's throttle sleep.
+        self._throttle_lock = threading.Lock()
         self._last_request = 0.0
         self._proxy_index = 0
-        self._url_cache: dict[str, str] = {}
         self._next_data_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._session: Any = None
         self._session_proxy: str | None = None
@@ -382,6 +384,12 @@ class LeboncoinClient:
         with self._lock:
             self._drop_session_locked()
 
+    def close(self) -> None:
+        """Release the warm session and its connection pool on shutdown."""
+        with self._lock:
+            self._drop_session_locked()
+            self._next_data_cache.clear()
+
     def _prime_session(self, session: Any) -> None:
         """Mint a DataDome cookie with the cheapest request that produces one.
 
@@ -464,7 +472,13 @@ class LeboncoinClient:
         raise LeboncoinError(f"Leboncoin request failed after retries: {last_error}")
 
     def _throttle(self) -> None:
-        with self._lock:
+        """Space out upstream calls without blocking cache readers.
+
+        The sleep is held under the dedicated throttle lock so concurrent callers
+        still queue (that is the point of the pacing), while `_lock` stays free for
+        cache and session bookkeeping.
+        """
+        with self._throttle_lock:
             elapsed = time.monotonic() - self._last_request
             wait_for = self.settings.lbc_min_interval - elapsed
             if wait_for > 0:
@@ -479,6 +493,13 @@ class LeboncoinClient:
         candidates: list[str | None] = list(self.settings.proxy_urls())
         if not candidates:
             return [None]
+        if self.settings.lbc_rotate_proxy_per_request and len(candidates) > 1:
+            # Start each request at the next pool entry, otherwise a healthy first proxy
+            # would serve every single call and the rest of the pool would stay idle.
+            with self._lock:
+                offset = self._proxy_index % len(candidates)
+                self._proxy_index += 1
+            candidates = candidates[offset:] + candidates[:offset]
         if self.settings.lbc_allow_direct_fallback:
             candidates.append(None)
         return candidates
@@ -629,8 +650,6 @@ class LeboncoinClient:
     ) -> SearchResult:
         ad_id = ad.get("list_id")
         url = self._absolute_url(ad.get("url"))
-        if ad_id and url:
-            self._url_cache[str(ad_id)] = url
         images = self._images(ad)
         attributes = ad.get("attributes")
         attribute_lookup = self._attribute_lookup(attributes)

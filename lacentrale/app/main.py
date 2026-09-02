@@ -182,7 +182,17 @@ async def get_listings(
     include_description: bool = Query(default=False),
     raw: bool = Query(default=False),
     debug: bool = Query(default=False),
-    max_workers: int = Query(default=4, ge=1, le=8),
+    max_workers: int = Query(
+        default=4,
+        ge=1,
+        le=8,
+        description=(
+            "Upper bound on concurrent fetches, itself capped by "
+            "CENTRALE_LISTING_MAX_WORKERS. Real throughput stays bounded by upstream "
+            "pacing (CENTRALE_MIN_INTERVAL, CENTRALE_WWW_MIN_INTERVAL), so raising "
+            "this only helps when most refs are already cached."
+        ),
+    ),
 ) -> dict[str, Any]:
     ref_list = [part.strip() for part in refs.split(",") if part.strip()]
     data = await anyio.to_thread.run_sync(

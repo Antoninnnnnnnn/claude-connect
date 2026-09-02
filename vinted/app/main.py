@@ -1,30 +1,44 @@
+import logging
+import secrets
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.config import Settings, get_settings
 from app.vinted_client import VintedClient, VintedError
 
-app = FastAPI(
-    title="Self-hosted Vinted Search API",
-    version="1.0.0",
-    docs_url="/docs",
-)
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 vinted = VintedClient(settings)
 
 
-@app.on_event("startup")
-async def startup() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    if not settings.api_key:
+        raise RuntimeError("API_KEY is not configured")
     await vinted.start()
-    await vinted.refresh_session(settings.default_domain)
+    try:
+        # Best effort: a Vinted outage at boot must not turn into a systemd restart
+        # loop. The first real request refreshes the session anyway.
+        await vinted.refresh_session(settings.default_domain)
+    except Exception as exc:  # noqa: BLE001 - upstream may be down or rate limiting
+        logger.warning("Initial Vinted session refresh failed, continuing: %s", exc)
+    try:
+        yield
+    finally:
+        await vinted.close()
 
 
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    await vinted.close()
+app = FastAPI(
+    title="Self-hosted Vinted Search API",
+    version="1.1.0",
+    docs_url="/docs",
+    lifespan=lifespan,
+)
 
 
 @app.exception_handler(VintedError)
@@ -37,19 +51,30 @@ async def http_error_handler(_: Request, exc: HTTPException) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"ok": False, "error": str(exc.detail)})
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"ok": False, "error": str(exc.errors())})
+
+
+@app.exception_handler(Exception)
+async def generic_error_handler(_: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled error: %s", exc)
+    return JSONResponse(status_code=500, content={"ok": False, "error": "Internal server error"})
+
+
 def require_api_key(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     current_settings: Settings = Depends(get_settings),
 ) -> None:
     if not current_settings.api_key:
         raise HTTPException(status_code=500, detail="API_KEY is not configured")
-    if x_api_key != current_settings.api_key:
+    if not x_api_key or not secrets.compare_digest(x_api_key, current_settings.api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "data": {"status": "up"}}
+    return {"ok": True, "data": vinted.health_status()}
 
 
 @app.get("/search", dependencies=[Depends(require_api_key)])

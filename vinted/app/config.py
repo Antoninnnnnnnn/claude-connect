@@ -18,7 +18,9 @@ class Settings(BaseSettings):
     )
 
     api_key: str = Field(default="", validation_alias=AliasChoices("API_KEY"))
-    host: str = Field(default="0.0.0.0", validation_alias=AliasChoices("VINTED_HOST", "HOST"))
+    # Bind loopback only: these services sit behind the local reverse proxy,
+    # nothing should reach them from off-box. Override with VINTED_HOST.
+    host: str = Field(default="127.0.0.1", validation_alias=AliasChoices("VINTED_HOST", "HOST"))
     port: int = Field(default=8091, validation_alias=AliasChoices("VINTED_PORT", "PORT"))
     default_domain: str = Field(default="fr", validation_alias=AliasChoices("VINTED_DEFAULT_DOMAIN", "DEFAULT_DOMAIN"))
     vinted_proxy: str | None = Field(default=None, validation_alias=AliasChoices("VINTED_PROXY"))

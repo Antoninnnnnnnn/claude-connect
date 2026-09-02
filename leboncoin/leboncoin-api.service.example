@@ -1,17 +1,17 @@
 [Unit]
-Description=Self-hosted EcoleDirecte API
+Description=Self-hosted Leboncoin Search API
 # Wants is required: After alone never pulls network-online.target in.
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/path/to/claude-connect/ecoledirecte
+WorkingDirectory=/path/to/claude-connect/leboncoin
 EnvironmentFile=/path/to/claude-connect/.env
-ExecStart=/bin/bash -lc 'exec /path/to/claude-connect/ecoledirecte/venv/bin/uvicorn main:app --host "${ED_HOST:-127.0.0.1}" --port "${ED_PORT:-8093}"'
+ExecStart=/bin/bash -lc 'exec /path/to/claude-connect/leboncoin/.venv/bin/uvicorn app.main:app --host "${LBC_HOST:-127.0.0.1}" --port "${LBC_PORT:-8092}"'
 Restart=always
 RestartSec=5
-MemoryMax=256M
+MemoryMax=384M
 StandardOutput=journal
 StandardError=journal
 

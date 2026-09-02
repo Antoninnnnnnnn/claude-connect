@@ -39,6 +39,8 @@ OpenAPI : `http://127.0.0.1:8091/docs`
 
 Fichier commun a la racine : `.env` (voir `.env.example`).
 
+Chaque service ecoute en loopback (`127.0.0.1`) par defaut : seul le reverse proxy local doit les joindre. Surcharger avec `<SERVICE>_HOST` si besoin.
+
 Authentification sur tous les endpoints proteges :
 
 ```http
@@ -84,7 +86,25 @@ Par defaut, chaque API renvoie un JSON minimal pour limiter le contexte LLM. Les
 
 ## Systemd
 
-Exemples de unites utilisateur dans chaque sous-dossier (`*.service.example`). Adapter les chemins absolus avant installation.
+Exemples de unites utilisateur dans chaque sous-dossier (`*.service.example`). Adapter les chemins absolus avant installation, puis :
+
+```bash
+cp vinted/vinted-api.service.example ~/.config/systemd/user/vinted-api.service
+systemctl --user daemon-reload
+systemctl --user enable --now vinted-api
+```
+
+## La Centrale : navigateur pour DataDome
+
+Le HTML de `www.lacentrale.fr` (description, vendeur) exige une clearance DataDome frappee par un vrai navigateur. Elle vit dans un virtualenv separe :
+
+```bash
+python3 -m venv .venv-browser
+.venv-browser/bin/pip install -r lacentrale/requirements-browser.txt
+.venv-browser/bin/python -m camoufox fetch
+```
+
+Le telechargement du navigateur demande environ 1,5 Go d'espace disque libre. Sans lui, la recherche et les fiches JSON fonctionnent, mais les descriptions sont indisponibles.
 
 ## Licence
 

@@ -17,7 +17,9 @@ class Settings(BaseSettings):
     )
 
     api_key: str = Field(default="", validation_alias=AliasChoices("API_KEY"))
-    host: str = Field(default="0.0.0.0", validation_alias=AliasChoices("LBC_HOST", "HOST"))
+    # Bind loopback only: these services sit behind the local reverse proxy,
+    # nothing should reach them from off-box. Override with LBC_HOST.
+    host: str = Field(default="127.0.0.1", validation_alias=AliasChoices("LBC_HOST", "HOST"))
     port: int = Field(default=8092, validation_alias=AliasChoices("LBC_PORT", "PORT"))
 
     lbc_proxy: str | None = Field(default=None, validation_alias=AliasChoices("LBC_PROXY"))

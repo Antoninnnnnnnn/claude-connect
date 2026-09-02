@@ -17,7 +17,9 @@ class Settings(BaseSettings):
     )
 
     api_key: str = Field(default="", validation_alias=AliasChoices("API_KEY"))
-    host: str = Field(default="0.0.0.0", validation_alias=AliasChoices("CENTRALE_HOST", "HOST"))
+    # Bind loopback only: these services sit behind the local reverse proxy,
+    # nothing should reach them from off-box. Override with CENTRALE_HOST.
+    host: str = Field(default="127.0.0.1", validation_alias=AliasChoices("CENTRALE_HOST", "HOST"))
     port: int = Field(default=8094, validation_alias=AliasChoices("CENTRALE_PORT", "PORT"))
 
     centrale_proxy: str | None = Field(default=None, validation_alias=AliasChoices("CENTRALE_PROXY"))
@@ -122,6 +124,13 @@ class Settings(BaseSettings):
     centrale_browser_mint_cooldown: float = Field(
         default=300.0,
         validation_alias=AliasChoices("CENTRALE_BROWSER_MINT_COOLDOWN"),
+    )
+    # Minting runs on its own thread; a request waits at most this long for it. Keep
+    # it well under the reverse proxy read timeout (nginx: 90s) so the client gets a
+    # clean error instead of a 504 while the browser keeps working.
+    centrale_browser_mint_wait: float = Field(
+        default=25.0,
+        validation_alias=AliasChoices("CENTRALE_BROWSER_MINT_WAIT"),
     )
     centrale_datadome_token_file: str = Field(
         default=str(PROJECT_ROOT / "data" / "datadome_token.json"),

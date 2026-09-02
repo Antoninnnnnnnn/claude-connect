@@ -28,8 +28,10 @@ https://<your-domain>/ecoledirecte-api
 
 - Toutes les réponses sont en JSON, compactées et épurées pour économiser le contexte.
 - Une réponse réussie a toujours `{"ok": true, "data": ...}`.
-- Une erreur a toujours `{"ok": false, "error": "..."}` ou un code HTTP d'erreur avec `{"detail": ...}`.
+- Une erreur a toujours `{"ok": false, "error": "..."}`, avec un code HTTP d'erreur.
 - Si l'API retourne une erreur `MFA_REQUIRED` (code HTTP 401), cela signifie que la session École Directe demande à valider un QCM. Tu dois récupérer la question dans la réponse, interroger l'utilisateur si tu n'as pas la réponse, et la soumettre via `POST /mfa`.
+- Un code HTTP 503 signale un login en cours ou un backoff après un échec : le message donne le délai. Attends ce délai, ne réessaie pas en boucle. École Directe bloque un compte après quelques logins refusés, donc les tentatives sont volontairement espacées.
+- Un code HTTP 502 sur `credentials rejected` signifie que les identifiants ou les réponses QCM sont à corriger : ne réessaie pas, signale-le à l'utilisateur.
 - Utilise `curl -sS -G --data-urlencode` pour les paramètres d'URL.
 - Ajoute `--connect-timeout 5 --max-time 60` pour éviter de rester bloqué (l'API de l'éducation nationale peut parfois être lente).
 - Ne pipe pas la réponse vers `python3 -m json.tool` ou `jq`, lis le JSON compact.
@@ -154,3 +156,20 @@ curl -sS -X POST \
 
 4. L'API renverra `{"ok": true, "message": "MFA answer submitted, login resuming"}`.
 5. Tu peux alors relancer ta requête originelle (`/schedule`, `/homework`, etc.). L'API relancera le login et te fournira tes données. S'il y a une deuxième question, recommence le processus.
+
+
+## Endpoint: Status (diagnostic de session)
+
+À utiliser quand une requête échoue, pour savoir pourquoi sans relancer de login.
+
+```
+GET /status
+```
+
+```bash
+curl -sS \
+  -H 'X-API-Key: <API_KEY>' \
+  'http://127.0.0.1:8093/status'
+```
+
+Renvoie l'état de connexion, le nombre d'échecs consécutifs, le délai de backoff restant (`retry_in_s`) et la dernière erreur. `GET /health` reste public mais ne donne que `{"status": "up"}`.

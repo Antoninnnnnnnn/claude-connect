@@ -8,7 +8,13 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from app.centrale_client import SORT_PARAMS
 
 
-CURRENT_YEAR = datetime.now().year
+def max_model_year() -> int:
+    """Upper bound for a model year, resolved per request.
+
+    Computed live: a module-level constant froze the bound at process start, so
+    after New Year's Eve the next model year was rejected until a restart.
+    """
+    return datetime.now().year + 1
 
 
 def effective_distance(distance_km: int | None, distance_bucket: int | None) -> int | None:
@@ -39,8 +45,8 @@ class SearchFilters(BaseModel):
     version: str | None = None
     price_min: float | None = Field(default=None, ge=0)
     price_max: float | None = Field(default=None, ge=0)
-    year_min: int | None = Field(default=None, ge=1900, le=CURRENT_YEAR + 1)
-    year_max: int | None = Field(default=None, ge=1900, le=CURRENT_YEAR + 1)
+    year_min: int | None = Field(default=None, ge=1900)
+    year_max: int | None = Field(default=None, ge=1900)
     mileage_min: int | None = Field(default=None, ge=0)
     mileage_max: int | None = Field(default=None, ge=0)
     zip: str | None = Field(default=None, pattern=r"^\d{5}$")
@@ -68,6 +74,13 @@ class SearchFilters(BaseModel):
     sort: str = "newest"
     page: int = Field(default=1, ge=1)
     url: str | None = None
+
+    @field_validator("year_min", "year_max")
+    @classmethod
+    def check_year(cls, value: int | None) -> int | None:
+        if value is not None and value > max_model_year():
+            raise ValueError(f"year must be <= {max_model_year()}")
+        return value
 
     @field_validator("sort")
     @classmethod
@@ -123,8 +136,8 @@ def search_filters_dependency(
     version: str | None = Query(default=None),
     price_min: float | None = Query(default=None, ge=0),
     price_max: float | None = Query(default=None, ge=0),
-    year_min: int | None = Query(default=None, ge=1900, le=CURRENT_YEAR + 1),
-    year_max: int | None = Query(default=None, ge=1900, le=CURRENT_YEAR + 1),
+    year_min: int | None = Query(default=None, ge=1900),
+    year_max: int | None = Query(default=None, ge=1900),
     mileage_min: int | None = Query(default=None, ge=0),
     mileage_max: int | None = Query(default=None, ge=0),
     zip: str | None = Query(default=None, pattern=r"^\d{5}$"),

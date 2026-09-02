@@ -453,6 +453,9 @@ class CentraleClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._lock = threading.Lock()
+        # Pacing gets its own lock: `_lock` guards the caches, cookies and sessions,
+        # and a cache hit must not queue behind another request's throttle sleep.
+        self._throttle_lock = threading.Lock()
         self._last_request = 0.0
         self._proxy_index = 0
         self._www_cookies: dict[str, str] = {}
@@ -707,7 +710,11 @@ class CentraleClient:
         if not clean_refs:
             return {"items": [], "errors": {}}
 
-        workers = max(1, min(max_workers or self.settings.centrale_listing_max_workers, len(clean_refs)))
+        # centrale_listing_max_workers is a hard ceiling, not a default: a caller
+        # asking for 8 must not exceed the configured budget.
+        ceiling = max(1, int(self.settings.centrale_listing_max_workers))
+        requested = int(max_workers) if max_workers else ceiling
+        workers = max(1, min(requested, ceiling, len(clean_refs)))
         items: list[dict[str, Any]] = []
         errors: dict[str, str] = {}
 
@@ -1763,7 +1770,13 @@ class CentraleClient:
         return False
 
     def _throttle(self) -> None:
-        with self._lock:
+        """Space out upstream calls without blocking cache readers.
+
+        The sleep is held under the dedicated throttle lock so concurrent callers
+        still queue (that is the point of the pacing), while `_lock` stays free for
+        cache, cookie and session bookkeeping.
+        """
+        with self._throttle_lock:
             elapsed = time.monotonic() - self._last_request
             minimum = self.settings.centrale_min_interval
             wait_for = random.uniform(minimum, minimum * 1.5) - elapsed

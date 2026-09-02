@@ -1,5 +1,7 @@
+# Pinned to the versions this service is running and tested against.
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
-httpx==0.28.1
 pydantic==2.10.4
 pydantic-settings==2.7.1
+python-dotenv==1.2.2
+httpx==0.28.1

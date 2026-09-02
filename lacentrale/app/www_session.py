@@ -14,6 +14,10 @@ The measured behaviour is:
 So we mint a cookie with the browser once (subprocess, separate virtualenv), then
 serve every www HTML request with curl_cffi at a safe pace, and re-mint whenever
 DataDome blocks us again.
+
+Minting is slow (~1 min, several on retries), so it runs on a background thread:
+a request waits at most `CENTRALE_BROWSER_MINT_WAIT` seconds and then fails with a
+"retry shortly" error rather than holding a worker past the reverse proxy timeout.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -38,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 MINT_SCRIPT = Path(__file__).resolve().parent / "mint_datadome.py"
 BLOCK_MARKERS = ("captcha-delivery", "geo.captcha-delivery.com")
+# camoufox prints one of these per download tick; they drown out the real error.
+PROGRESS_LINE_RE = re.compile(r"^(Downloading|Extracting|Unpacking|Fetching)\b.*\d+%\s*$", re.I)
 
 
 class DatadomeUnavailable(RuntimeError):
@@ -54,10 +61,14 @@ class WwwFetcher:
         self.settings = settings
         self._proxy_provider = proxy_provider
         self._lock = threading.Lock()
+        self._throttle_lock = threading.Lock()
         self._token: dict[str, object] | None = None
         self._last_fetch = 0.0
         self._last_mint_failure = 0.0
         self._mint_count = 0
+        self._mint_thread: threading.Thread | None = None
+        self._mint_done: threading.Event | None = None
+        self._mint_error: str | None = None
         self._load_token()
 
     # ------------------------------------------------------------------ state
@@ -71,6 +82,14 @@ class WwwFetcher:
             age = None
             if token:
                 age = round(time.time() - float(token.get("minted_at") or 0.0), 1)
+            minting = self._mint_thread is not None and self._mint_thread.is_alive()
+            cooldown_left = 0.0
+            if self._last_mint_failure:
+                cooldown_left = max(
+                    0.0,
+                    float(self.settings.centrale_browser_mint_cooldown)
+                    - (time.time() - self._last_mint_failure),
+                )
             return {
                 "enabled": bool(self.settings.centrale_browser_enabled),
                 "browser_python": self.settings.centrale_browser_python,
@@ -78,6 +97,9 @@ class WwwFetcher:
                 "has_token": token is not None,
                 "token_age_s": age,
                 "mints": self._mint_count,
+                "minting": minting,
+                "mint_error": self._mint_error,
+                "mint_cooldown_s": round(cooldown_left, 1) or None,
             }
 
     def _token_path(self) -> Path:
@@ -119,15 +141,8 @@ class WwwFetcher:
 
     # ------------------------------------------------------------------- mint
 
-    def _mint_locked(self) -> dict[str, object]:
-        """Spawn the browser and return a fresh token. Caller holds no lock."""
-        if not self.available():
-            raise DatadomeUnavailable(f"browser python not found: {self.settings.centrale_browser_python}")
-        cooldown = float(self.settings.centrale_browser_mint_cooldown)
-        since_failure = time.time() - self._last_mint_failure
-        if self._last_mint_failure and since_failure < cooldown:
-            raise DatadomeUnavailable(f"mint cooling down ({cooldown - since_failure:.0f}s left)")
-
+    def _run_mint(self) -> dict[str, object]:
+        """Spawn the browser and return a fresh token. Holds no lock."""
         proxy = self.settings.centrale_browser_proxy or self.settings.centrale_proxy or ""
         cmd: list[str] = []
         if self.settings.centrale_browser_xvfb:
@@ -152,38 +167,123 @@ class WwwFetcher:
                     cwd=str(MINT_SCRIPT.parent.parent),
                 )
             except subprocess.TimeoutExpired:
-                self._last_mint_failure = time.time()
                 raise DatadomeUnavailable("browser mint timed out") from None
             if proc.returncode != 0 or not out_path.exists():
-                self._last_mint_failure = time.time()
-                detail = (proc.stderr or proc.stdout or "").strip()[:300]
-                raise DatadomeUnavailable(f"browser mint failed: {detail}")
-            token = json.loads(out_path.read_text(encoding="utf-8"))
+                raise DatadomeUnavailable(f"browser mint failed: {self._mint_failure_detail(proc)}")
+            return json.loads(out_path.read_text(encoding="utf-8"))
 
-        self._last_mint_failure = 0.0
-        self._mint_count += 1
-        self._store_token(token)
-        logger.info("DataDome cookie minted (%d cookies)", len(token.get("cookies") or {}))
-        return token
+    @staticmethod
+    def _mint_failure_detail(proc: "subprocess.CompletedProcess[str]") -> str:
+        """Summarise a failed mint run.
+
+        camoufox floods stderr with addon download progress, which used to fill the
+        300-char head of the message and hide the actual exception. Progress lines are
+        dropped and the tail is kept, because that is where the error lands.
+        """
+        lines: list[str] = []
+        for stream in (proc.stderr, proc.stdout):
+            for line in (stream or "").splitlines():
+                clean = line.strip()
+                if not clean or PROGRESS_LINE_RE.match(clean):
+                    continue
+                if clean not in lines:
+                    lines.append(clean)
+        if not lines:
+            return f"no diagnostic output (exit {proc.returncode})"
+        return " | ".join(lines[-4:])[:500]
+
+    def _mint_worker(self) -> None:
+        """Background mint: never runs on a request thread."""
+        try:
+            token = self._run_mint()
+        except DatadomeUnavailable as exc:
+            with self._lock:
+                self._last_mint_failure = time.time()
+                self._mint_error = str(exc)
+            logger.warning("DataDome mint failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - subprocess boundary, keep the thread quiet
+            with self._lock:
+                self._last_mint_failure = time.time()
+                self._mint_error = f"{exc.__class__.__name__}: {exc}"
+            logger.warning("DataDome mint crashed: %s", exc)
+        else:
+            self._store_token(token)
+            with self._lock:
+                self._token = token
+                self._last_mint_failure = 0.0
+                self._mint_error = None
+                self._mint_count += 1
+            logger.info("DataDome cookie minted (%d cookies)", len(token.get("cookies") or {}))
+        finally:
+            with self._lock:
+                done = self._mint_done
+                self._mint_thread = None
+            if done is not None:
+                done.set()
+
+    def _start_mint_locked(self) -> threading.Event:
+        """Ensure a mint is running and return the event that marks its end.
+
+        Single-flight: concurrent callers share one browser run. Caller holds `_lock`.
+        """
+        if self._mint_thread is not None and self._mint_thread.is_alive():
+            return self._mint_done  # type: ignore[return-value]
+        if not self.available():
+            raise DatadomeUnavailable(f"browser python not found: {self.settings.centrale_browser_python}")
+        cooldown = float(self.settings.centrale_browser_mint_cooldown)
+        since_failure = time.time() - self._last_mint_failure
+        if self._last_mint_failure and since_failure < cooldown:
+            raise DatadomeUnavailable(
+                f"mint cooling down ({cooldown - since_failure:.0f}s left)"
+                + (f": {self._mint_error}" if self._mint_error else "")
+            )
+        done = threading.Event()
+        thread = threading.Thread(target=self._mint_worker, name="datadome-mint", daemon=True)
+        self._mint_done = done
+        self._mint_thread = thread
+        thread.start()
+        return done
 
     def _ensure_token(self, force: bool = False) -> dict[str, object]:
+        """Return a usable token, waiting only a bounded amount for a fresh mint.
+
+        Minting takes ~1 min and can retry for several, which is far longer than the
+        reverse proxy's read timeout. So the browser runs on its own thread and a
+        request waits at most `centrale_browser_mint_wait` seconds before giving up;
+        the mint keeps going and the next request picks up the result.
+        """
         with self._lock:
             token = self._token
             if token and not force and not self._token_expired(token):
                 return token
-            # Minting is slow (~1 min); holding the lock serialises concurrent callers
-            # so a single browser run serves all of them.
-            token = self._mint_locked()
-            self._token = token
+            done = self._start_mint_locked()
+
+        budget = max(0.0, float(self.settings.centrale_browser_mint_wait))
+        if not done.wait(timeout=budget):
+            raise DatadomeUnavailable(
+                f"DataDome clearance is being minted in the background "
+                f"(waited {budget:.0f}s); retry shortly"
+            )
+
+        with self._lock:
+            token = self._token
+            error = self._mint_error
+        if token is not None and not self._token_expired(token):
             return token
+        raise DatadomeUnavailable(error or "no DataDome clearance available")
 
     # ------------------------------------------------------------------ fetch
 
     def _throttle(self) -> None:
+        """Pace www fetches on a dedicated lock.
+
+        `_lock` also serialises minting and token reads; sleeping under it made a
+        status() call or a concurrent token check wait out the full interval.
+        """
         interval = max(0.0, float(self.settings.centrale_www_min_interval))
         if interval <= 0:
             return
-        with self._lock:
+        with self._throttle_lock:
             wait = interval - (time.monotonic() - self._last_fetch)
             if wait > 0:
                 time.sleep(wait)
