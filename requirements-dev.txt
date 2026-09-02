@@ -1,0 +1,5 @@
+# Test tooling, installed into each service virtualenv:
+#   for v in vinted/.venv leboncoin/.venv lacentrale/.venv ecoledirecte/venv; do
+#     $v/bin/pip install -r requirements-dev.txt
+#   done
+pytest==9.1.1

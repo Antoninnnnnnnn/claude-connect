@@ -449,7 +449,7 @@ class VintedClient:
     def _parse_price_text(value: str | None) -> float | None:
         if not value:
             return None
-        clean = re.sub(r"[^0-9,\\.]", "", value).replace(",", ".")
+        clean = re.sub(r"[^0-9,.]", "", value).replace(",", ".")
         try:
             return float(clean)
         except ValueError:
@@ -508,7 +508,9 @@ class VintedClient:
         last_seen = re.search(r'data-testid="seller-last-logged-in"[^>]*>([^<]+)<', html)
         if last_seen:
             seller["last_seen"] = html_lib.unescape(last_seen.group(1)).strip()
-        rating = re.search(r'aria-label="[^"]*noté\\s+([0-9,.]+)\\s+sur\\s+5"', html)
+        # `\s` must reach the regex engine as whitespace: the previous `\\s` matched a
+        # literal backslash, so no rating was ever extracted.
+        rating = re.search(r'aria-label="[^"]*noté\s+([0-9,.]+)\s+sur\s+5"', html)
         if rating:
             seller["rating"] = float(rating.group(1).replace(",", "."))
         return seller or None

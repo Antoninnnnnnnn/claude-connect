@@ -672,7 +672,9 @@ class LeboncoinClient:
             url=url,
             image=images[0] if include_image and images else None,
             image_count=self._image_count(ad, images),
-            images=images if include_images else None,
+            # `or None` so an ad without photos omits the key instead of shipping
+            # `"images": []` to the model for no information.
+            images=(images or None) if include_images else None,
             first_publication_date=ad.get("first_publication_date"),
             index_date=ad.get("index_date"),
             location=self._compact_location(ad.get("location"), include_coordinates=include_coordinates),

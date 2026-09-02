@@ -106,6 +106,32 @@ python3 -m venv .venv-browser
 
 Le telechargement du navigateur demande environ 1,5 Go d'espace disque libre. Sans lui, la recherche et les fiches JSON fonctionnent, mais les descriptions sont indisponibles.
 
+## Tests
+
+Chaque service a ses tests dans son propre virtualenv. Lanceur unique :
+
+```bash
+scripts/run_tests.sh
+```
+
+Deux niveaux, pour deux modes de panne differents :
+
+- **Tests unitaires** (`<service>/tests/`) : hors reseau, rapides. Ils figent notre
+  parsing sur des fixtures et attrapent nos regressions. Notamment le contournement
+  `_sanitize_payload` de Leboncoin, les parseurs HTML/JS de La Centrale, le scraping
+  de fiche Vinted, et le backoff de login EcoleDirecte.
+- **Canaris de contrat** (`tests_live/`) : opt-in, ils interrogent les vrais services.
+  Ce sont eux qui detectent un changement de site, cas que les fixtures ne peuvent
+  pas voir puisque le parseur continue de renvoyer `None` sans erreur.
+
+```bash
+scripts/run_tests.sh --live
+```
+
+Les canaris exigent les services demarres et le `.env` reel. Un echec de canari
+signale que le site a bouge, pas que le code a regresse : lire l'assertion, puis
+corriger le parseur du service concerne.
+
 ## Licence
 
 Usage personnel / auto-heberge. Les APIs interrogent des services tiers (Vinted, Leboncoin, La Centrale, EcoleDirecte) : respecter leurs conditions d'utilisation.
