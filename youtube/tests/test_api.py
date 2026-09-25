@@ -96,3 +96,50 @@ def test_strict_miss_is_404_with_languages(api):
 def test_languages_endpoint(api):
     data = api.get("/languages", params={"video": VID}).json()["data"]
     assert data == {"video_id": VID, "cached": False, "languages": [{"code": "en", "name": "English", "generated": False}]}
+
+
+@pytest.mark.parametrize(
+    "path,params",
+    [
+        ("/search", {"q": "x", "type": "channel", "duration": "long"}),
+        ("/search", {"q": "x", "limit": 0}),
+        ("/channel", {"channel": "@foo", "tab": "playlists", "sort": "popular"}),
+        ("/channel", {"channel": "https://example.com/@foo"}),
+        ("/channel", {"channel": "@foo", "next": "garbage"}),
+        ("/playlist", {"playlist": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}),
+        ("/video", {"video": "not a video"}),
+    ],
+)
+def test_browse_endpoints_validate_before_calling_youtube(api, monkeypatch, path, params):
+    def boom(*args, **kwargs):
+        raise AssertionError("YouTube must not be called")
+
+    monkeypatch.setattr(YouTubeClient, "_innertube", boom)
+    response = api.get(path, params=params)
+    assert response.status_code == 422 and response.json()["ok"] is False
+
+
+@pytest.mark.parametrize("path", ["/search?q=x", "/channel?channel=@foo", "/playlist?playlist=PLabcdefghij", "/video?video=dQw4w9WgXcQ"])
+def test_browse_endpoints_require_the_key(api, path):
+    del api.headers["X-API-Key"]
+    assert api.get(path).status_code == 401
+
+
+def test_search_response_shape(api, monkeypatch):
+    payload = {
+        "contents": {
+            "twoColumnSearchResultsRenderer": {
+                "primaryContents": {
+                    "sectionListRenderer": {
+                        "contents": [{"itemSectionRenderer": {"contents": [{"videoRenderer": {"videoId": VID, "title": {"simpleText": "t"}}}]}}]
+                    }
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(YouTubeClient, "_innertube", lambda self, *a, **k: payload)
+    body = api.get("/search", params={"q": "x"}).json()
+    assert body == {
+        "ok": True,
+        "data": {"items": [{"type": "video", "id": VID, "title": "t", "url": f"https://www.youtube.com/watch?v={VID}"}], "count": 1, "next": None},
+    }

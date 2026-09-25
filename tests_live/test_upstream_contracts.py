@@ -247,3 +247,30 @@ def test_youtube_languages_lists_tracks(call):
     data = call("youtube", "/languages", video="https://youtu.be/dQw4w9WgXcQ").json()
     codes = {track["code"] for track in data["data"]["languages"]}
     assert "en" in codes
+
+
+def test_youtube_search_still_parses(call):
+    """Catches: YouTube renaming or migrating search renderers (videoRenderer ->
+    lockupViewModel is half done in 2026-09). The parser skips what it does not know,
+    so a shape change shows up as no items or items missing fields, not as an error."""
+    data = call("youtube", "/search", q="3blue1brown neural network", limit=25).json()["data"]
+    videos = [item for item in data["items"] if item["type"] == "video"]
+    assert len(videos) >= 5, data
+    assert all(len(video["id"]) == 11 and video.get("title") for video in videos)
+    assert sum(bool(video.get("duration")) for video in videos) >= len(videos) // 2, "durations lost"
+    assert data["next"], "search continuation token lost"
+
+
+def test_youtube_channel_tab_and_sort_still_parse(call):
+    """Catches: the channel tab params, the sort chips, or the lockup layout changing."""
+    data = call("youtube", "/channel", channel="@3blue1brown", limit=3).json()["data"]
+    assert data["channel"]["id"] == "UCYO_jab_esuFRV4b17AJtAw"
+    assert data["count"] == 3 and all(item.get("duration") for item in data["items"]), data
+    popular = call("youtube", "/channel", channel="@3blue1brown", sort="popular", limit=1).json()["data"]
+    # Its most viewed video has held the top spot for years.
+    assert popular["items"][0]["id"] == "aircAruvnKk", popular
+
+
+def test_youtube_video_metadata_still_parses(call):
+    data = call("youtube", "/video", video="dQw4w9WgXcQ").json()["data"]
+    assert data["published"].startswith("2009-10-2") and data["views"] > 1_000_000_000

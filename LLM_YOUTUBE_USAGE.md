@@ -1,6 +1,6 @@
 # Instructions LLM - API YouTube Transcript
 
-Utilise cette API HTTP pour lire les sous-titres d'une video YouTube : resumer, repondre a une question sur la video, citer un passage avec son horodatage.
+Utilise cette API HTTP pour lire les sous-titres d'une video YouTube (resumer, repondre a une question, citer un passage avec son horodatage), chercher des videos, lister les videos d'une chaine ou d'une playlist, et lire les metadonnees d'une video.
 
 ## Auth
 
@@ -118,6 +118,93 @@ GET /languages?video=<id ou URL>
 
 Liste des pistes : `[{"code": "en", "name": "English", "generated": false}, ...]`. Rarement utile : `/transcript` choisit deja la piste, et renvoie la liste en cas de fallback ou d'erreur `language_not_found`.
 
+## Endpoint: Search
+
+```http
+GET /search?q=<mots-cles>
+```
+
+```bash
+curl -sS --connect-timeout 5 --max-time 90 \
+  -H 'X-API-Key: <API_KEY>' \
+  -G 'http://127.0.0.1:8095/search' \
+  --data-urlencode 'q=recette pain maison' \
+  --data-urlencode 'limit=10'
+```
+
+Parametres :
+
+- `q` : requis.
+- `type` : `video` (defaut), `channel`, `playlist`, ou `all` (resultats mixtes de YouTube).
+- `duration` (videos) : `short` (<4 min), `medium` (4-20 min), `long` (>20 min).
+- `upload` (videos) : `hour`, `today`, `week`, `month`, `year`. Pour "les plus recentes", filtre avec `upload` : il n'y a pas de tri par date (YouTube l'ignore).
+- `sort` : `relevance` (defaut) ou `views`.
+- `limit` : nombre d'items, 1 a 100, defaut 20. Demande seulement ce qu'il te faut.
+- `next` : voir Pagination.
+
+Reponse :
+
+```json
+{"ok": true, "data": {
+  "items": [
+    {"type": "video", "id": "aircAruvnKk", "title": "But what is a neural network? | Deep learning chapter 1",
+     "channel": "3Blue1Brown", "channel_id": "UCYO_jab_esuFRV4b17AJtAw", "duration": "18:40",
+     "views": "24 M de vues", "published": "il y a 8 ans", "url": "https://www.youtube.com/watch?v=aircAruvnKk"},
+    {"type": "channel", "id": "UC...", "title": "...", "handle": "@...", "subscribers": "220 k abonnés", "description": "...", "url": "..."},
+    {"type": "playlist", "id": "PL...", "title": "...", "channel": "...", "video_count": "18 vidéos", "url": "..."}
+  ],
+  "count": 3,
+  "next": "eyJ0Ijo..."
+}}
+```
+
+- Chaque item a `type`, `id`, `url` ; les autres champs sont omis quand YouTube ne les donne pas (ex. pas de `channel_id` sur une collaboration, pas de `duration` sur un live en cours).
+- `views`, `published`, `duration` sont des textes tels qu'affiches par YouTube, en francais (`"2,2 M de vues"`, `"il y a 6 jours"`), approximatifs : pour une date ou un nombre exact, appelle `/video`.
+- Un titre peut etre une traduction francaise fournie par YouTube. `/video` et `/transcript` donnent le titre d'origine.
+
+## Endpoint: Channel
+
+```http
+GET /channel?channel=<@handle | UC... | URL de chaine>
+```
+
+```bash
+curl -sS --connect-timeout 5 --max-time 90 \
+  -H 'X-API-Key: <API_KEY>' \
+  -G 'http://127.0.0.1:8095/channel' \
+  --data-urlencode 'channel=@3blue1brown' \
+  --data-urlencode 'limit=10'
+```
+
+Parametres :
+
+- `channel` : requis. `@handle`, ID `UC...`, ou URL (`/@nom`, `/channel/UC...`, `/c/nom`, `/user/nom`).
+- `tab` : `videos` (defaut), `shorts`, `streams` (lives passes et a venir), `playlists`.
+- `sort` : `latest` (defaut), `popular`, `oldest`. Pas disponible sur `tab=playlists`.
+- `limit`, `next` : comme pour search.
+
+Reponse : `data.channel` (`id`, `title`, `handle`, `subscribers`, `video_count`, `description`, `url`, seulement sur la premiere page), puis `items`, `count`, `next`. Les items de `tab=shorts` ont `type: "short"`, sans duree ni date.
+
+## Endpoint: Playlist
+
+```http
+GET /playlist?playlist=<PL... ou URL avec list=>
+```
+
+Reponse : `data.playlist` (`id`, `title`, `description`, `channel_id`, `url`, premiere page seulement), puis `items`, `count`, `next`. `limit`, `next` comme pour search.
+
+## Endpoint: Video (metadonnees)
+
+```http
+GET /video?video=<id ou URL>
+```
+
+Reponse : `id`, `title`, `channel`, `channel_id`, `duration_seconds`, `views` (nombre exact), `published` (date ISO exacte), `category`, `keywords`, `description` (complete), `url`, et `is_live` pour un live. Un appel leger (~4 KB) : utilise-le pour une date exacte, la description ou les liens, pas pour le contenu parle (c'est `/transcript`).
+
+## Pagination (search, channel, playlist)
+
+Si `next` n'est pas `null`, il reste des resultats. Rappelle le meme endpoint avec **les memes parametres** et `next=<valeur recue>`, sans la modifier. La suite reprend exactement apres le dernier item recu. `next: null` = fin de liste.
+
 ## Erreurs
 
 | `error_code` | HTTP | Que faire |
@@ -131,8 +218,16 @@ Liste des pistes : `[{"code": "en", "name": "English", "generated": false}, ...]
 | `blocked` | 502 | YouTube a bloque toutes les IP essayees. Reessaie une fois plus tard, pas en boucle. |
 | `po_token_required` | 502 | Piste protegee par YouTube, non recuperable pour l'instant. |
 | `network_error`, `upstream_error` | 502 | Probleme reseau ou YouTube. Reessaie une fois. |
+| `invalid_reference` | 422 | `channel`, `playlist` ou `next` invalide. Pour `next`, repasse la valeur recue telle quelle. |
+| `channel_not_found`, `playlist_not_found` | 404 | Chaine ou playlist inexistante (ou privee). Verifie le handle, ou cherche-la avec `/search?type=channel`. |
+| `sort_unavailable` | 422 | Cet onglet n'a pas ce tri. Reessaie avec `sort=latest`. |
+| `upstream_rejected` | 502 | YouTube refuse la requete. Ne reessaie pas en boucle, signale-le. |
 
 ## Strategie Recommandee
+
+Pour trouver une video : `/search`, puis `/transcript` sur l'`id` choisi. Pour "les dernieres videos de X" : `/channel?channel=@X` (si tu n'as pas le handle, `/search?type=channel&q=X` d'abord). Pour une date de publication exacte : `/video`.
+
+Pour lire une video :
 
 1. Appelle `/transcript` avec la video et `lang` dans la langue de l'utilisateur puis `en` (`lang=fr,en`).
 2. Si `truncated` est `false`, tu as tout : reponds.

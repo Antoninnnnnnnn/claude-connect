@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import Settings, get_settings
 from app.formatting import duration, render
+from app.innertube import InvalidReference, decode_cursor, parse_playlist_id
 from app.video_id import InvalidVideo, parse_video_id
 from app.yt_client import YouTubeClient, YouTubeError
 
@@ -45,6 +46,11 @@ async def youtube_error_handler(_: Request, exc: YouTubeError) -> JSONResponse:
 @app.exception_handler(InvalidVideo)
 async def invalid_video_handler(_: Request, exc: InvalidVideo) -> JSONResponse:
     return JSONResponse(status_code=422, content={"ok": False, "error": str(exc), "error_code": "invalid_video_id"})
+
+
+@app.exception_handler(InvalidReference)
+async def invalid_reference_handler(_: Request, exc: InvalidReference) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"ok": False, "error": str(exc), "error_code": "invalid_reference"})
 
 
 @app.exception_handler(HTTPException)
@@ -136,4 +142,75 @@ async def transcript(
         # On a fallback the agent needs the list to decide whether to retry.
         data["available_languages"] = result["available_languages"]
     data["cached"] = result["cached"]
+    return {"ok": True, "data": data}
+
+
+LIMIT = Query(default=20, ge=1, le=100, description="Items to return. Pages upstream as needed; `next` continues exactly after the last one.")
+NEXT = Query(default=None, max_length=4000, description="`next` from the previous response, with the same other parameters.")
+
+
+def check_cursor(cursor: str | None) -> None:
+    """Reject a mangled `next` before any upstream call (channel resolution included)."""
+    if cursor:
+        decode_cursor(cursor)
+
+
+@app.get("/search", dependencies=[Depends(require_api_key)])
+async def search(
+    q: str = Query(..., min_length=1, max_length=200, description="Search terms, as typed in YouTube's search bar."),
+    type: Literal["video", "channel", "playlist", "all"] = Query(default="video", description="all: YouTube's mixed results."),
+    duration: Literal["short", "medium", "long"] | None = Query(default=None, description="Videos only. short: <4 min, medium: 4-20 min, long: >20 min."),
+    upload: Literal["hour", "today", "week", "month", "year"] | None = Query(default=None, description="Videos only: uploaded within this period."),
+    sort: Literal["relevance", "views"] = Query(default="relevance"),
+    limit: int = LIMIT,
+    next: str | None = NEXT,
+) -> dict[str, Any]:
+    check_cursor(next)
+    video_filters = duration or upload
+    if video_filters and type not in ("video", "all"):
+        raise HTTPException(status_code=422, detail="duration and upload only apply to type=video")
+    search_type = None if type == "all" and not video_filters else ("video" if type == "all" else type)
+    data = await anyio.to_thread.run_sync(
+        lambda: youtube.search(
+            q, type=search_type, duration=duration, upload=upload, sort=sort, limit=limit, cursor=next
+        )
+    )
+    return {"ok": True, "data": data}
+
+
+@app.get("/channel", dependencies=[Depends(require_api_key)])
+async def channel(
+    channel: str = Query(..., max_length=300, description="@handle, UC... channel ID, or channel URL."),
+    tab: Literal["videos", "shorts", "streams", "playlists"] = Query(default="videos", description="streams: past and upcoming lives."),
+    sort: Literal["latest", "popular", "oldest"] = Query(default="latest", description="Not available on the playlists tab."),
+    limit: int = LIMIT,
+    next: str | None = NEXT,
+) -> dict[str, Any]:
+    check_cursor(next)
+    if tab == "playlists" and sort != "latest":
+        raise HTTPException(status_code=422, detail="sort is not available on the playlists tab")
+    data = await anyio.to_thread.run_sync(
+        lambda: youtube.channel(channel, tab=tab, sort=sort, limit=limit, cursor=next)
+    )
+    return {"ok": True, "data": data}
+
+
+@app.get("/playlist", dependencies=[Depends(require_api_key)])
+async def playlist(
+    playlist: str = Query(..., max_length=300, description="Playlist ID (PL...) or any URL with list=."),
+    limit: int = LIMIT,
+    next: str | None = NEXT,
+) -> dict[str, Any]:
+    check_cursor(next)
+    playlist_id = parse_playlist_id(playlist)
+    data = await anyio.to_thread.run_sync(lambda: youtube.playlist(playlist_id, limit=limit, cursor=next))
+    return {"ok": True, "data": data}
+
+
+@app.get("/video", dependencies=[Depends(require_api_key)])
+async def video(
+    video: str = Query(..., description="Video ID or any YouTube URL (watch, youtu.be, shorts, embed, live)."),
+) -> dict[str, Any]:
+    video_id = parse_video_id(video)
+    data = await anyio.to_thread.run_sync(lambda: youtube.video(video_id))
     return {"ok": True, "data": data}

@@ -1,7 +1,8 @@
+import json
 import logging
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 import requests
 from youtube_transcript_api import (
@@ -18,6 +19,7 @@ from youtube_transcript_api import (
     YouTubeRequestFailed,
 )
 
+from app import innertube
 from app.config import Settings
 from app.light import full_api_factory, light_api_factory
 from app.video_id import watch_url
@@ -26,9 +28,28 @@ from app.video_id import watch_url
 logger = logging.getLogger(__name__)
 
 OEMBED_URL = "https://www.youtube.com/oembed"
+# youtube.com's own headers: innertube answers a bare python-requests UA differently.
+WEB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+    "Origin": "https://www.youtube.com",
+}
+
+T = TypeVar("T")
+
+
+class InnertubeBlocked(Exception):
+    """innertube answered 429/403: this egress IP is throttled or flagged."""
+
 
 # A new exit IP can fix these: YouTube flagged the IP, or the proxy itself failed.
-RETRYABLE = (RequestBlocked, YouTubeRequestFailed, YouTubeDataUnparsable, FailedToCreateConsentCookie, requests.RequestException)
+RETRYABLE = (
+    RequestBlocked,
+    YouTubeRequestFailed,
+    YouTubeDataUnparsable,
+    FailedToCreateConsentCookie,
+    InnertubeBlocked,
+    requests.RequestException,
+)
 
 
 class YouTubeError(RuntimeError):
@@ -123,6 +144,7 @@ class YouTubeClient:
         self._last_request = 0.0
         self._proxy_index = 0
         self._cache: dict[Any, tuple[float, Any]] = {}
+        self._browse_cache: dict[Any, tuple[float, Any]] = {}
 
     # ------------------------------------------------------------------ public
 
@@ -197,6 +219,142 @@ class YouTubeClient:
     def _transcript_key(video_id: str, track: dict[str, Any]) -> tuple[Any, ...]:
         return ("transcript", video_id, track["code"], track["generated"])
 
+    def search(
+        self,
+        query: str,
+        *,
+        type: str | None,
+        duration: str | None,
+        upload: str | None,
+        sort: str | None,
+        limit: int,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"query": query}
+        params = innertube.search_params(type=type, duration=duration, upload=upload, sort=sort)
+        if params:
+            body["params"] = params
+        return self._paged("search", lambda: self._innertube("search", body, f"search {query!r}"), limit, cursor)
+
+    def channel(self, channel: str, *, tab: str, sort: str, limit: int, cursor: str | None) -> dict[str, Any]:
+        """A channel tab's items, plus the channel header on the first page.
+
+        A non-default sort is a second request: YouTube only exposes it as the
+        continuation token of a chip on the tab's first page.
+        """
+        channel_id = self._resolve_channel(channel)
+        info: dict[str, Any] = {}
+
+        def first() -> dict[str, Any]:
+            payload = self._innertube(
+                "browse", {"browseId": channel_id, "params": innertube.CHANNEL_TABS[tab]}, f"channel {channel_id}"
+            )
+            parsed = innertube.parse_channel_info(payload)
+            if parsed is None:
+                raise YouTubeError(404, "channel_not_found", "This channel does not exist.")
+            info.update(parsed)
+            if sort == "latest":
+                return payload
+            chips = innertube.sort_chip_tokens(payload)
+            index = innertube.CHANNEL_SORTS[sort]
+            if index >= len(chips):
+                raise YouTubeError(422, "sort_unavailable", f"This tab offers no '{sort}' sort.")
+            return self._innertube("browse", {"continuation": chips[index]}, f"channel {channel_id} {sort}")
+
+        data = self._paged("browse", first, limit, cursor)
+        for item in data["items"]:
+            # A channel's own page leaves out who uploaded: it is the channel.
+            if item["type"] in ("video", "short") and "channel_id" not in item:
+                item["channel_id"] = channel_id
+        if cursor is None:
+            data = {"channel": info, **data}
+        return data
+
+    def playlist(self, playlist_id: str, *, limit: int, cursor: str | None) -> dict[str, Any]:
+        info: dict[str, Any] = {}
+
+        def first() -> dict[str, Any]:
+            try:
+                payload = self._innertube("browse", {"browseId": f"VL{playlist_id}"}, f"playlist {playlist_id}")
+            except YouTubeError as exc:
+                # YouTube answers an unknown playlist ID with a bare HTTP 400.
+                if exc.code in ("upstream_rejected", "not_found"):
+                    raise YouTubeError(404, "playlist_not_found", "This playlist does not exist or is private.") from exc
+                raise
+            parsed = innertube.parse_playlist_info(payload, playlist_id)
+            if parsed is None:
+                raise YouTubeError(404, "playlist_not_found", "This playlist does not exist or is private.")
+            info.update(parsed)
+            return payload
+
+        data = self._paged("browse", first, limit, cursor)
+        if cursor is None:
+            data = {"playlist": info, **data}
+        return data
+
+    def video(self, video_id: str) -> dict[str, Any]:
+        payload = self._innertube(
+            "player",
+            {"videoId": video_id},
+            f"video {video_id}",
+            headers={"X-Goog-FieldMask": innertube.VIDEO_FIELD_MASK},
+        )
+        data = innertube.parse_video(payload)
+        if data is None:
+            raise YouTubeError(404, "video_unavailable", "Video unavailable (deleted, private or wrong ID).")
+        return data
+
+    def _resolve_channel(self, channel: str) -> str:
+        kind, value = innertube.parse_channel_ref(channel)
+        if kind == "id":
+            return value
+        try:
+            payload = self._innertube("navigation/resolve_url", {"url": value}, f"resolve {value}")
+        except YouTubeError as exc:
+            if exc.code in ("not_found", "upstream_rejected"):
+                raise YouTubeError(404, "channel_not_found", f"No channel at {value}.") from exc
+            raise
+        browse_id = (payload.get("endpoint") or {}).get("browseEndpoint", {}).get("browseId")
+        if not isinstance(browse_id, str) or not browse_id.startswith("UC"):
+            raise YouTubeError(404, "channel_not_found", f"No channel at {value}.")
+        return browse_id
+
+    def _paged(
+        self,
+        endpoint: str,
+        first: Callable[[], dict[str, Any]],
+        limit: int,
+        cursor: str | None,
+    ) -> dict[str, Any]:
+        """Collect at least `limit` items across upstream pages, then cut exactly.
+
+        The cursor names the upstream page and how many of its items were served, so a
+        cut in the middle of a page loses nothing: the next call re-reads that page
+        (a cache hit) and skips ahead. The first page is `first()`, rebuilt from the
+        caller's own parameters, which is why they must repeat them with `next`.
+        """
+        token, offset = innertube.decode_cursor(cursor) if cursor else (None, 0)
+        items: list[dict[str, Any]] = []
+        next_cursor: str | None = None
+        for _ in range(max(1, self.settings.yt_max_pages)):
+            payload = self._innertube(endpoint, {"continuation": token}, "page") if token else first()
+            page, page_next = innertube.parse_items(payload)
+            remaining = page[offset:]
+            room = limit - len(items)
+            if len(remaining) > room:
+                items.extend(remaining[:room])
+                next_cursor = innertube.encode_cursor(token, offset + room)
+                break
+            items.extend(remaining)
+            if not page_next:
+                next_cursor = None
+                break
+            token, offset = page_next, 0
+            next_cursor = innertube.encode_cursor(token, 0)
+            if len(items) >= limit:
+                break
+        return {"items": items, "count": len(items), "next": next_cursor}
+
     # ---------------------------------------------------------------- upstream
 
     def _routes(self) -> list[str | None]:
@@ -220,11 +378,13 @@ class YouTubeClient:
         return routes
 
     def _with_retries(self, video_id: str, work: Callable[[Any, requests.Session], dict[str, Any]]) -> dict[str, Any]:
-        """Run `work` on a fresh session per attempt, moving egress on block.
+        """Transcript attempts: a fresh YouTubeTranscriptApi per attempt is required, not
+        just convenient: the library is not thread-safe, and endpoints run in the anyio
+        thread pool."""
+        return self._attempts(video_id, lambda session, route: work(self._api_factory(session, route), session))
 
-        A fresh YouTubeTranscriptApi per attempt is required, not just convenient: the
-        library is not thread-safe, and endpoints run in the anyio thread pool.
-        """
+    def _attempts(self, label: str, work: Callable[[requests.Session, str | None], T]) -> T:
+        """Run `work` on a fresh session per attempt, moving egress on block."""
         routes = self._routes()
         deadline = time.monotonic() + max(1.0, float(self.settings.yt_deadline))
         last_error: Exception | None = None
@@ -234,7 +394,7 @@ class YouTubeClient:
             self._throttle()
             session = TimeoutSession(self.settings.yt_timeout, deadline)
             try:
-                return work(self._api_factory(session, route), session)
+                return work(session, route)
             except YouTubeError:
                 raise
             except RETRYABLE as exc:
@@ -243,7 +403,7 @@ class YouTubeClient:
                     "YouTube attempt %d/%d for %s via %s failed: %s",
                     attempt,
                     len(routes),
-                    video_id,
+                    label,
                     "proxy" if route else "direct",
                     type(exc).__name__,
                 )
@@ -252,6 +412,55 @@ class YouTubeClient:
             finally:
                 session.close()
         raise map_error(last_error) from last_error
+
+    def _innertube(
+        self,
+        endpoint: str,
+        body: dict[str, Any],
+        label: str,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """POST one innertube WEB call, cached briefly on its exact body."""
+        key = ("innertube", endpoint, json.dumps(body, sort_keys=True), json.dumps(headers or {}, sort_keys=True))
+        cached = self._cached(key, browse=True)
+        if cached is not None:
+            return cached
+        context = innertube.web_context(self.settings.yt_web_client_version, self.settings.yt_hl, self.settings.yt_gl)
+
+        def work(session: requests.Session, route: str | None) -> dict[str, Any]:
+            if route:
+                session.proxies = {"http": route, "https": route}
+            response = session.post(
+                f"{innertube.INNERTUBE_URL}/{endpoint}",
+                params={"prettyPrint": "false"},
+                json={"context": context, **body},
+                headers={**WEB_HEADERS, "Accept-Language": f"{self.settings.yt_hl},en;q=0.8", **(headers or {})},
+            )
+            status = response.status_code
+            if status in (403, 429):
+                raise InnertubeBlocked(f"HTTP {status}")
+            if status >= 500:
+                raise requests.HTTPError(f"{status} Server Error")
+            if status == 404:
+                raise YouTubeError(404, "not_found", "Not found on YouTube.")
+            if status >= 400:
+                # Same answer from any IP: a bad argument, or a client version YouTube dropped.
+                raise YouTubeError(
+                    502,
+                    "upstream_rejected",
+                    f"YouTube rejected the request (HTTP {status}). If every call fails this way, bump YT_WEB_CLIENT_VERSION.",
+                )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise requests.HTTPError("innertube answer is not JSON") from exc
+            if not isinstance(payload, dict):
+                raise requests.HTTPError("innertube answer is not an object")
+            return payload
+
+        payload = self._attempts(label, work)
+        self._store(key, payload, browse=True)
+        return payload
 
     def _oembed(self, session: requests.Session, video_id: str) -> dict[str, Any]:
         """Best effort: a failed title lookup must never fail the transcript."""
@@ -277,30 +486,36 @@ class YouTubeClient:
 
     # ------------------------------------------------------------------- cache
 
-    def _cached(self, key: Any) -> Any | None:
-        ttl = max(0.0, float(self.settings.yt_cache_ttl))
+    def _cache_for(self, browse: bool) -> tuple[dict[Any, tuple[float, Any]], float, int]:
+        if browse:
+            return self._browse_cache, float(self.settings.yt_browse_cache_ttl), int(self.settings.yt_browse_cache_max_entries)
+        return self._cache, float(self.settings.yt_cache_ttl), int(self.settings.yt_cache_max_entries)
+
+    def _cached(self, key: Any, browse: bool = False) -> Any | None:
+        cache, ttl, _ = self._cache_for(browse)
         if ttl <= 0:
             return None
         now = time.monotonic()
         with self._lock:
-            entry = self._cache.get(key)
+            entry = cache.get(key)
             if not entry:
                 return None
             stored_at, data = entry
             if now - stored_at > ttl:
-                self._cache.pop(key, None)
+                cache.pop(key, None)
                 return None
             return data
 
-    def _store(self, key: Any, data: Any) -> None:
-        if self.settings.yt_cache_ttl <= 0:
+    def _store(self, key: Any, data: Any, browse: bool = False) -> None:
+        cache, ttl, max_entries = self._cache_for(browse)
+        if ttl <= 0:
             return
-        max_entries = max(1, int(self.settings.yt_cache_max_entries))
+        max_entries = max(1, max_entries)
         with self._lock:
-            self._cache[key] = (time.monotonic(), data)
-            while len(self._cache) > max_entries:
-                oldest = min(self._cache, key=lambda item: self._cache[item][0])
-                self._cache.pop(oldest, None)
+            cache[key] = (time.monotonic(), data)
+            while len(cache) > max_entries:
+                oldest = min(cache, key=lambda item: cache[item][0])
+                cache.pop(oldest, None)
 
 
 def map_error(exc: Exception | None) -> YouTubeError:
@@ -319,7 +534,7 @@ def map_error(exc: Exception | None) -> YouTubeError:
         return YouTubeError(422, "video_unplayable", f"Video unplayable: {reason}.")
     if isinstance(exc, PoTokenRequired):
         return YouTubeError(502, "po_token_required", "YouTube requires a PO token for this track: not retrievable for now.")
-    if isinstance(exc, RequestBlocked):
+    if isinstance(exc, (RequestBlocked, InnertubeBlocked)):
         return YouTubeError(502, "blocked", "YouTube blocked every egress IP tried. Retry later.")
     if isinstance(exc, requests.RequestException):
         return YouTubeError(502, "network_error", f"Could not reach YouTube: {type(exc).__name__}.")

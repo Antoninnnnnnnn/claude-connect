@@ -57,6 +57,22 @@ class Settings(BaseSettings):
     yt_cache_ttl: float = Field(default=21600.0, validation_alias=AliasChoices("YT_CACHE_TTL"))
     yt_cache_max_entries: int = Field(default=64, validation_alias=AliasChoices("YT_CACHE_MAX_ENTRIES"))
 
+    # Search, channel, playlist and video metadata use the innertube WEB client (app/innertube.py).
+    # YouTube accepts older client versions for a long while; if these endpoints start
+    # answering `upstream_rejected`, bump this to the clientVersion youtube.com sends today.
+    yt_web_client_version: str = Field(default="2.20250925.01.00", validation_alias=AliasChoices("YT_WEB_CLIENT_VERSION"))
+    # Interface language: YouTube ranks results for it and shows titles translated into it
+    # when a translation exists (creator-provided or automatic), so a French user wants fr:
+    # hl=en turns French videos' titles into English. gl sets the ranking region.
+    yt_hl: str = Field(default="fr", validation_alias=AliasChoices("YT_HL"))
+    yt_gl: str = Field(default="FR", validation_alias=AliasChoices("YT_GL"))
+    # Result pages go stale quickly but get re-read on every `next` that cuts a page:
+    # a short TTL, and a cache of their own so they never evict transcripts.
+    yt_browse_cache_ttl: float = Field(default=600.0, validation_alias=AliasChoices("YT_BROWSE_CACHE_TTL"))
+    yt_browse_cache_max_entries: int = Field(default=128, validation_alias=AliasChoices("YT_BROWSE_CACHE_MAX_ENTRIES"))
+    # Upstream pages one call may fetch to reach `limit` (~20 results per search page, ~30 per channel page).
+    yt_max_pages: int = Field(default=5, validation_alias=AliasChoices("YT_MAX_PAGES"))
+
     @field_validator("yt_proxy", "yt_proxies", "decodo_proxy", "dataimpulse_proxy", "evomi_proxy", mode="before")
     @classmethod
     def blank_to_none(cls, value: str | None) -> str | None:
