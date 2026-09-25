@@ -12,6 +12,7 @@ Chaque connecteur tourne en service independant. Une cle API commune protege tou
 | Leboncoin | 8092 | [`leboncoin/`](leboncoin/) | [`LLM_LEBONCOIN_USAGE.md`](LLM_LEBONCOIN_USAGE.md) |
 | EcoleDirecte | 8093 | [`ecoledirecte/`](ecoledirecte/) | [`LLM_ECOLEDIRECTE_USAGE.md`](LLM_ECOLEDIRECTE_USAGE.md) |
 | La Centrale | 8094 | [`lacentrale/`](lacentrale/) | [`LLM_CENTRALE_USAGE.md`](LLM_CENTRALE_USAGE.md) |
+| YouTube | 8095 | [`youtube/`](youtube/) | [`LLM_YOUTUBE_USAGE.md`](LLM_YOUTUBE_USAGE.md) |
 
 ## Demarrage rapide
 
@@ -52,7 +53,9 @@ Ne jamais committer `.env`, les cookies de session, ni les reponses QCM EcoleDir
 ## Exposer a Claude.ai
 
 1. Heberger les APIs sur un VPS (systemd ou process manager).
-2. Placer un reverse proxy HTTPS devant chaque service — voir [`deploy/nginx.example.conf`](deploy/nginx.example.conf).
+2. Exposer chaque service en HTTPS, au choix :
+   - **Cloudflare Tunnel** (domaine sur Cloudflare) : aucun port ouvert, pas de certificat a gerer, un sous-domaine par service — voir [`deploy/cloudflared.example.yml`](deploy/cloudflared.example.yml).
+   - **nginx** avec certificats — voir [`deploy/nginx.example.conf`](deploy/nginx.example.conf).
 3. Donner a l'assistant le fichier `LLM_*_USAGE.md` correspondant (instructions curl, parametres, regles de contexte).
 
 Les docs `LLM_*_USAGE.md` du repo sont des modeles generiques (`<API_KEY>`, `127.0.0.1`). Pour un deploiement perso avec domaine et cle reelles, copier vers `*.local.md` (fichiers ignores par git).
@@ -78,6 +81,14 @@ La Centrale :
 ```bash
 curl -H "X-API-Key: $API_KEY" \
   "http://127.0.0.1:8094/search?make=RENAULT&model=ZOE&price_max=8000&zip=27000&distance_km=5&limit=5"
+```
+
+YouTube (sous-titres) :
+
+```bash
+curl -H "X-API-Key: $API_KEY" -G "http://127.0.0.1:8095/transcript" \
+  --data-urlencode "video=https://www.youtube.com/watch?v=aircAruvnKk" \
+  --data-urlencode "lang=fr,en"
 ```
 
 ## Reponses compactes

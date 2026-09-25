@@ -1,0 +1,27 @@
+# Exemple Cloudflare Tunnel : alternative a nginx + certificats, aucun port a ouvrir.
+# Un sous-domaine par service, directement vers son port local (pas de prefixe a retirer).
+#
+#   cloudflared tunnel login
+#   cloudflared tunnel create claude-connect
+#   cloudflared tunnel route dns claude-connect youtube-api.your-domain.example   # une fois par hostname
+#   cp deploy/cloudflared.example.yml ~/.cloudflared/claude-connect.yml           # puis adapter
+#   cloudflared tunnel --config ~/.cloudflared/claude-connect.yml ingress validate
+#
+# Service systemd utilisateur : deploy/cloudflared-claude-connect.service.example
+# Cloudflare coupe une requete a 100s : YT_DEADLINE (75s) reste en dessous.
+
+tunnel: <TUNNEL_ID>
+credentials-file: /home/<user>/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: vinted-api.your-domain.example
+    service: http://127.0.0.1:8091
+  - hostname: leboncoin-api.your-domain.example
+    service: http://127.0.0.1:8092
+  - hostname: ecoledirecte-api.your-domain.example
+    service: http://127.0.0.1:8093
+  - hostname: centrale-api.your-domain.example
+    service: http://127.0.0.1:8094
+  - hostname: youtube-api.your-domain.example
+    service: http://127.0.0.1:8095
+  - service: http_status:404

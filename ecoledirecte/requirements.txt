@@ -1,3 +1,5 @@
+# Needs Python >= 3.12: ecoledirecte 0.2.10 uses PEP 701 f-strings (SyntaxError on 3.11).
+#   uv venv --python 3.12 venv && uv pip install --python venv/bin/python -r requirements.txt
 fastapi==0.136.3
 uvicorn[standard]==0.48.0
 pydantic==2.13.4

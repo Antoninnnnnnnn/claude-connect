@@ -25,6 +25,7 @@ SERVICES = {
     "leboncoin": ("LIVE_BASE_LEBONCOIN", "http://127.0.0.1:8092"),
     "ecoledirecte": ("LIVE_BASE_ECOLEDIRECTE", "http://127.0.0.1:8093"),
     "lacentrale": ("LIVE_BASE_CENTRALE", "http://127.0.0.1:8094"),
+    "youtube": ("LIVE_BASE_YOUTUBE", "http://127.0.0.1:8095"),
 }
 
 

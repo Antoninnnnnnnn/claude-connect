@@ -1,0 +1,12 @@
+# Pinned to the versions this service is running and tested against.
+fastapi==0.136.3
+uvicorn[standard]==0.48.0
+pydantic==2.13.4
+pydantic-settings==2.14.1
+python-dotenv==1.2.2
+requests==2.34.2
+# TestClient dependency, used by the unit tests.
+httpx==0.28.1
+# Scrapes the watch page and the innertube player API: YouTube changes break it
+# without warning. Re-run the live canary (tests_live) before bumping, and after.
+youtube-transcript-api==1.2.4

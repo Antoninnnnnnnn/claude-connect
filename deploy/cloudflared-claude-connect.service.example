@@ -1,0 +1,15 @@
+[Unit]
+Description=Cloudflare Tunnel for claude-connect
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/<user>/.local/bin/cloudflared --no-autoupdate tunnel --config /home/<user>/.cloudflared/claude-connect.yml run
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

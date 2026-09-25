@@ -1,0 +1,19 @@
+[Unit]
+Description=Self-hosted YouTube Transcript API
+# Wants is required: After alone never pulls network-online.target in.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/claude-connect/youtube
+EnvironmentFile=/path/to/claude-connect/.env
+ExecStart=/bin/bash -lc 'exec /path/to/claude-connect/youtube/.venv/bin/uvicorn app.main:app --host "${YT_HOST:-127.0.0.1}" --port "${YT_PORT:-8095}"'
+Restart=always
+RestartSec=5
+MemoryMax=256M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -15,10 +15,11 @@ declare -A VENVS=(
   [leboncoin]=".venv"
   [lacentrale]=".venv"
   [ecoledirecte]="venv"
+  [youtube]=".venv"
 )
 
 status=0
-for service in vinted leboncoin ecoledirecte lacentrale; do
+for service in vinted leboncoin ecoledirecte lacentrale youtube; do
   pytest="$ROOT/$service/${VENVS[$service]}/bin/pytest"
   if [ ! -x "$pytest" ]; then
     echo "== $service: SKIP (no venv at $service/${VENVS[$service]})"

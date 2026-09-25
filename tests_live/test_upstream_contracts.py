@@ -13,16 +13,16 @@ pytestmark = pytest.mark.live
 # --------------------------------------------------------------------- health
 
 
-@pytest.mark.parametrize("service", ["vinted", "leboncoin", "ecoledirecte", "lacentrale"])
+@pytest.mark.parametrize("service", ["vinted", "leboncoin", "ecoledirecte", "lacentrale", "youtube"])
 def test_health_is_up(http, bases, service):
     response = http.get(f"{bases[service]}/health")
     assert response.status_code == 200
     assert response.json()["ok"] is True
 
 
-@pytest.mark.parametrize("service", ["vinted", "leboncoin", "ecoledirecte", "lacentrale"])
+@pytest.mark.parametrize("service", ["vinted", "leboncoin", "ecoledirecte", "lacentrale", "youtube"])
 def test_api_key_is_enforced(http, bases, service):
-    path = {"ecoledirecte": "/status"}.get(service, "/search")
+    path = {"ecoledirecte": "/status", "youtube": "/languages"}.get(service, "/search")
     response = http.get(f"{bases[service]}{path}")
     assert response.status_code == 401, "protected endpoint answered without a key"
     assert response.json()["ok"] is False
@@ -221,3 +221,29 @@ def test_ecoledirecte_health_hides_session_state(http, bases):
     """Public probe must not expose login state; /status is key-protected."""
     data = http.get(f"{bases['ecoledirecte']}/health").json()
     assert "session" not in data["data"]
+
+
+# -------------------------------------------------------------------- YouTube
+
+
+def test_youtube_transcript_still_parses(call):
+    """Catches: YouTube changing the watch page or innertube player response that
+    youtube-transcript-api scrapes. dQw4w9WgXcQ has carried a manual English track
+    for years, so a miss here is a breakage, not a video change."""
+    # A 502 (every egress IP blocked) skips inside call(): a proxy problem, not a parser break.
+    body = call("youtube", "/transcript", video="dQw4w9WgXcQ", lang="en", strict="true", max_chars=2000).json()
+    assert body["ok"] is True, body
+    data = body["data"]
+    assert data["language_code"] == "en" and data["is_generated"] is False
+    assert data["text"].startswith("["), "timestamped paragraphs lost"
+    assert "never gonna" in data["text"].lower()
+    assert data["duration"] and data["duration"] > 150
+    # videoDetails comes through the light path's field mask: a missing title means
+    # YouTube stopped honouring the mask (the service still works via the fallback).
+    assert data.get("title"), "title lost: check the X-Goog-FieldMask light path"
+
+
+def test_youtube_languages_lists_tracks(call):
+    data = call("youtube", "/languages", video="https://youtu.be/dQw4w9WgXcQ").json()
+    codes = {track["code"] for track in data["data"]["languages"]}
+    assert "en" in codes
