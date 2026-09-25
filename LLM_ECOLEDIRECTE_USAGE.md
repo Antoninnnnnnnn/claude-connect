@@ -72,6 +72,8 @@ Récupère les devoirs à faire, triés par date.
 GET /homework
 ```
 
+Parametre : `with_content` (defaut `true`) ajoute le texte de chaque devoir (un appel EcoleDirecte de plus par date). `with_content=false` pour une simple liste matieres/dates.
+
 Exemple recommandé :
 ```bash
 curl -sS --connect-timeout 5 --max-time 60 \
@@ -143,7 +145,7 @@ Si l'API te renvoie une erreur 401 avec `{"error": "MFA_REQUIRED"}`, c'est qu'É
 
 **Flux à suivre :**
 1. Lis la réponse de l'erreur 401 qui contient `{"mfa_data": {"question": "...", "propositions": ["...", "..."]}}`.
-2. Trouve la réponse parmi les `propositions` (demande à l'utilisateur si tu ne sais pas).
+2. Choisis la réponse parmi les `propositions`, recopiée caractère pour caractère. Ne devine jamais : si tu n'es pas certain, pose la question à l'utilisateur. Une mauvaise réponse est un login raté, et plusieurs peuvent bloquer le compte.
 3. Soumets la réponse via POST :
 
 ```bash
@@ -155,7 +157,10 @@ curl -sS -X POST \
 ```
 
 4. L'API renverra `{"ok": true, "message": "MFA answer submitted, login resuming"}`.
-5. Tu peux alors relancer ta requête originelle (`/schedule`, `/homework`, etc.). L'API relancera le login et te fournira tes données. S'il y a une deuxième question, recommence le processus.
+5. Attends ~10 secondes puis appelle `GET /mfa` : s'il renvoie `"mfa_required": true`, une nouvelle question attend (`data.question`, `data.propositions`), recommence a l'etape 2. Sinon relance ta requete originelle.
+6. EcoleDirecte n'accorde que 2 questions par tentative de login. Si la requete originelle renvoie `nombre d'essais est épuisé`, ce n'est pas grave : les reponses sont enregistrees. Relance-la apres le delai indique (`retry in Ns`), la prochaine question connue passera toute seule.
+
+`GET /mfa` sans question en attente renvoie `{"ok": true, "mfa_required": false}`.
 
 
 ## Endpoint: Status (diagnostic de session)

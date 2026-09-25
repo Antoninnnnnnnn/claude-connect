@@ -259,6 +259,14 @@ Reponse :
 - `source` : `json`, `html`, ou `json+html` (JSON enrichi par parse HTML)
 - `include_description=true` peut declencher un fetch HTML si le JSON ne contient pas la description
 
+## Endpoint: Listings (plusieurs fiches)
+
+```http
+GET /listings?refs=B104008382,W102941021
+```
+
+Memes parametres que `/listing/{ref}` (`include_image`, `include_dealer`, `include_vehicle`, `include_description`), plus `refs` (references separees par virgule). A preferer a plusieurs appels `/listing/{ref}` pour comparer quelques annonces. Garde `max_workers` par defaut : le debit reel est limite par le rythme impose cote La Centrale.
+
 ## Endpoint: Price stats
 
 ```http
