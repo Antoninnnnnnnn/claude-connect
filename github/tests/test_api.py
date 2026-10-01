@@ -146,6 +146,7 @@ def test_repo_info_gives_clone_url_on_this_host(api, upstream):
         200, json={"full_name": "me/repo", "private": True, "default_branch": "main", "permissions": {"push": True}}
     )
     data = api.get("/me/repo.git").json()["data"]
+    assert upstream.requests[0][0].headers["authorization"] == "Bearer ghp_test"
     assert data["clone_url"] == "http://testserver/me/repo.git"
     assert data["private"] is True and data["can_push"] is True
 

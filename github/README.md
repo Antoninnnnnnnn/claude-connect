@@ -4,7 +4,7 @@ Mini-API FastAPI qui expose les repos GitHub du proprietaire, prives compris, so
 
 Points importants :
 
-- **Un seul token GitHub** (`GITHUB_TOKEN`) sert toutes les requetes. Quiconque a `API_KEY` a les droits de ce token : utiliser un token fine-grained limite au strict necessaire (voir Configuration).
+- **Un seul token GitHub** (`GITHUB_TOKEN`) sert toutes les requetes : en Bearer pour l'API REST, en Basic `x-access-token` pour git. Quiconque a `API_KEY` a les droits de ce token : utiliser un token fine-grained limite au strict necessaire (voir Configuration).
 - **Relais git smart HTTP** : `GET /<owner>/<repo>/info/refs` et `POST /<owner>/<repo>/git-upload-pack|git-receive-pack` sont relayes vers `github.com/<owner>/<repo>.git/...` en streaming dans les deux sens (aucun pack en memoire, compatible `MemoryMax`).
   - Corps bruts (`aiter_raw`) : le `Content-Encoding` gzip passe tel quel, sans decodage/re-encodage.
   - `Git-Protocol` est relaye : protocole v2 de bout en bout.

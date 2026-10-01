@@ -43,7 +43,7 @@ def quote_path(path: str) -> str:
 class GitHubClient:
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
         self.settings = settings
-        auth = self._auth_headers()
+        token = settings.github_token.strip()
         self.api = httpx.AsyncClient(
             base_url=settings.github_api_url.rstrip("/"),
             timeout=settings.gh_timeout,
@@ -51,7 +51,7 @@ class GitHubClient:
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
                 "User-Agent": "claude-connect-github",
-                **auth,
+                **({"Authorization": f"Bearer {token}"} if token else {}),
             },
             transport=transport,
         )
@@ -59,15 +59,15 @@ class GitHubClient:
         # GitHub packs objects. Connect still fails fast.
         self.git = httpx.AsyncClient(
             timeout=httpx.Timeout(settings.gh_timeout, read=None, write=None),
-            headers=auth,
+            headers=self._git_auth(token),
             transport=transport,
         )
 
-    def _auth_headers(self) -> dict[str, str]:
-        token = self.settings.github_token.strip()
+    @staticmethod
+    def _git_auth(token: str) -> dict[str, str]:
+        # Git smart HTTP only takes Basic; the user name is ignored for PATs.
         if not token:
             return {}
-        # Basic works for both the REST API and git smart HTTP, with classic and fine-grained PATs.
         basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
         return {"Authorization": f"Basic {basic}"}
 
