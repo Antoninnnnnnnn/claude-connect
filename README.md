@@ -13,6 +13,7 @@ Chaque connecteur tourne en service independant. Une cle API commune protege tou
 | EcoleDirecte | 8093 | [`ecoledirecte/`](ecoledirecte/) | [`LLM_ECOLEDIRECTE_USAGE.md`](LLM_ECOLEDIRECTE_USAGE.md) |
 | La Centrale | 8094 | [`lacentrale/`](lacentrale/) | [`LLM_CENTRALE_USAGE.md`](LLM_CENTRALE_USAGE.md) |
 | YouTube | 8095 | [`youtube/`](youtube/) | [`LLM_YOUTUBE_USAGE.md`](LLM_YOUTUBE_USAGE.md) |
+| GitHub | 8096 | [`github/`](github/) | [`LLM_GITHUB_USAGE.md`](LLM_GITHUB_USAGE.md) |
 
 ## Demarrage rapide
 

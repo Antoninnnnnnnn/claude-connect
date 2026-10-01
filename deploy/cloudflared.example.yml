@@ -24,4 +24,7 @@ ingress:
     service: http://127.0.0.1:8094
   - hostname: youtube-api.your-domain.example
     service: http://127.0.0.1:8095
+  # Pas de suffixe -api : le proxy GitHub imite github.com, les URLs se lisent comme celles de GitHub.
+  - hostname: github.your-domain.example
+    service: http://127.0.0.1:8096
   - service: http_status:404
