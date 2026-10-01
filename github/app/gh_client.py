@@ -15,11 +15,24 @@ class GitHubError(Exception):
         self.code = code
 
 
+def upstream_message(response: httpx.Response) -> str:
+    """GitHub's own explanation ("No commit found for SHA: x"), when it gave one."""
+    try:
+        message = response.json().get("message")
+    except (ValueError, AttributeError):
+        return ""
+    return message.strip()[:300] if isinstance(message, str) else ""
+
+
 def raise_for_upstream(response: httpx.Response) -> None:
     """Map a GitHub API failure to an error the agent can act on."""
     status = response.status_code
     if status < 400:
         return
+    detail = upstream_message(response)
+    suffix = f" (GitHub: {detail})" if detail else ""
+    if status == 404 and "repository is empty" in detail.lower():
+        raise GitHubError("Repository is empty", status=409, code="empty_repository")
     if status == 404:
         # GitHub answers 404, not 403, when the token cannot see a private repo.
         raise GitHubError("Not found, or the token has no access to it", status=404, code="not_found")
@@ -30,10 +43,13 @@ def raise_for_upstream(response: httpx.Response) -> None:
     ):
         raise GitHubError("GitHub rate limit reached, retry later", status=429, code="rate_limited")
     if status == 403:
-        raise GitHubError("GitHub refused: the token lacks the permission", status=403, code="forbidden")
+        raise GitHubError(f"GitHub refused: the token lacks the permission{suffix}", status=403, code="forbidden")
     if status == 409:
         raise GitHubError("Repository is empty", status=409, code="empty_repository")
-    raise GitHubError(f"GitHub answered HTTP {status}", status=502, code="upstream_error")
+    if status == 422:
+        # A bad ref or SHA, or a path that is not a directory: the caller's mistake, not ours.
+        raise GitHubError(f"GitHub rejected the request{suffix}", status=422, code="invalid_request")
+    raise GitHubError(f"GitHub answered HTTP {status}{suffix}", status=502, code="upstream_error")
 
 
 def quote_path(path: str) -> str:
@@ -54,6 +70,9 @@ class GitHubClient:
                 **({"Authorization": f"Bearer {token}"} if token else {}),
             },
             transport=transport,
+            # A renamed or transferred repo answers 301 to its new location. httpx drops
+            # Authorization on a cross-origin hop, so following is safe.
+            follow_redirects=True,
         )
         # No read/write timeout: a big clone or push can stay quiet for minutes while
         # GitHub packs objects. Connect still fails fast.
@@ -84,12 +103,19 @@ class GitHubClient:
         return response.json()
 
     async def api_stream(
-        self, path: str, *, accept: str, params: Mapping[str, Any] | None = None, follow_redirects: bool = False
+        self,
+        path: str,
+        *,
+        accept: str,
+        params: Mapping[str, Any] | None = None,
+        timeout: httpx.Timeout | None = None,
     ) -> httpx.Response:
         """Open a streamed API response; the caller must aclose() it."""
-        request = self.api.build_request("GET", path, params=params, headers={"Accept": accept})
+        request = self.api.build_request(
+            "GET", path, params=params, headers={"Accept": accept}, timeout=timeout or self.api.timeout
+        )
         try:
-            response = await self.api.send(request, stream=True, follow_redirects=follow_redirects)
+            response = await self.api.send(request, stream=True)
         except httpx.HTTPError as exc:
             raise GitHubError(f"GitHub unreachable: {type(exc).__name__}") from exc
         if response.status_code >= 400:

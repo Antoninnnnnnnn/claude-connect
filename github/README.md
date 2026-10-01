@@ -12,7 +12,8 @@ Points importants :
   - Un 401 GitHub n'est jamais renvoye a git (il accuserait la cle API et redemanderait des identifiants) : il devient un 403 ou 404 avec un message `remote:` lisible.
   - Pas de timeout de lecture sur ce relais : GitHub peut mettre longtemps a preparer le pack d'un gros clone.
 - **Auth** : `X-API-Key`, `Authorization: Bearer <cle>`, ou Basic avec la cle en mot de passe (ou en nom d'utilisateur). Chaque 401 porte `WWW-Authenticate: Basic` : git n'envoie le `x:<cle>@` de l'URL qu'apres ce defi, et un navigateur affiche sa fenetre de connexion.
-- **Navigation** : `/blob`, `/raw`, `/tree`, `/branches`, `/commits`, `/archive` passent par l'API REST GitHub. Les fichiers texte (HTML et SVG compris) sont servis en `text/plain` avec `nosniff` : rien ne s'execute sur ce domaine.
+- **Navigation** : `/blob`, `/raw`, `/tree`, `/branches`, `/commits`, `/commit/<sha>` (et `.diff`), `/archive` passent par l'API REST GitHub. Seuls quelques types binaires inertes (images raster, PDF, archives, polices, audio/video) gardent leur type ; tout le reste est servi en `text/plain` avec `nosniff` et `Content-Security-Policy: sandbox` : rien ne s'execute sur ce domaine.
+- **Refs** : une ref contenant `..`, `:` ou un caractere de controle est refusee avant tout appel (elle finit dans un chemin d'URL de l'API, ou `..` remonterait hors du repo). Un lien github.com avec une branche `feature/x` dans le chemin est resolu en essayant les lectures successives de `<ref>/<chemin>` sur 404.
 - **Archives** : GitHub redirige vers codeload avec un jeton temporaire dans l'URL ; le proxy suit la redirection lui-meme et streame l'archive, l'URL ne sort pas.
 - **Sans token** : les repos publics restent lisibles et clonables (60 appels API/heure), utile pour tester le relais.
 

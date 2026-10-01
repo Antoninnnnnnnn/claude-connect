@@ -4,14 +4,19 @@ import logging
 import mimetypes
 import re
 import secrets
-from urllib.parse import quote
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import quote
 
+import httpx
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.datastructures import MutableHeaders
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.config import Settings, get_settings
 from app.gh_client import GitHubClient, GitHubError, quote_path
@@ -28,8 +33,20 @@ GIT_SERVICES = {"git-upload-pack", "git-receive-pack"}
 GIT_REQUEST_HEADERS = ("content-type", "content-encoding", "accept", "user-agent", "git-protocol")
 GIT_RESPONSE_HEADERS = ("content-type", "content-encoding", "expires", "pragma")
 AUTH_CHALLENGE = {"WWW-Authenticate": 'Basic realm="claude-connect-github", charset="UTF-8"'}
-# Types a browser would render or run: always served as plain text from this domain.
-ACTIVE_TYPES = {"text/html", "image/svg+xml", "application/xhtml+xml", "application/xml", "text/xml"}
+# Raw files keep their own type only when it is one of these inert binary types; anything
+# else (HTML, SVG, XML, `.rs` guessed as application/rls-services+xml, unknown...) is
+# served as plain text so nothing renders or runs on this domain. An allowlist, because
+# mimetypes also reads the host's /etc/mime.types and guesses differ between machines.
+BINARY_TYPES = {
+    "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp", "image/tiff",
+    "image/x-icon", "image/vnd.microsoft.icon",
+    "application/pdf", "application/zip", "application/gzip", "application/x-tar", "application/x-bzip2",
+    "application/x-xz", "application/x-7z-compressed", "application/wasm", "application/octet-stream",
+}
+BINARY_PREFIXES = ("font/", "audio/", "video/")
+# Commit patches are capped so one call stays a readable size; `.diff` has the full one.
+MAX_PATCH_CHARS = 20_000
+MAX_COMMIT_PATCH_CHARS = 200_000
 
 
 @asynccontextmanager
@@ -48,13 +65,30 @@ app = FastAPI(
 )
 
 
-@app.middleware("http")
-async def no_shared_cache(request: Request, call_next):
-    response = await call_next(request)
-    # Cloudflare caches .js/.css/.png/... URLs by default when the origin says nothing:
-    # a private file read once would then be served to anyone, key or not.
-    response.headers["Cache-Control"] = "private, no-store"
-    return response
+class NoSharedCache:
+    """Cloudflare caches .js/.css/.png/... URLs by default when the origin says nothing:
+    a private file read once would then be served to anyone, key or not.
+
+    Plain ASGI rather than @app.middleware: that one re-pipes every streamed body, and
+    the git relay streams whole packs through here."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_header(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["Cache-Control"] = "private, no-store"
+            await send(message)
+
+        await self.app(scope, receive, send_with_header)
+
+
+app.add_middleware(NoSharedCache)
 
 
 class AuthError(Exception):
@@ -88,13 +122,26 @@ async def bad_request_handler(_: Request, exc: BadRequest) -> JSONResponse:
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
-    return JSONResponse(status_code=422, content={"ok": False, "error": str(exc.errors())})
+    return error_response(422, str(exc.errors()), "invalid_request")
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+    if exc.status_code == 404:
+        # Mostly github.com URLs this proxy does not mirror (/pull/3, /issues, /compare...).
+        return error_response(
+            404,
+            "Unknown endpoint. Supported: /repos, /<owner>/<repo>, .../tree, .../blob, .../raw, "
+            ".../commits, .../commit/<sha>, .../branches, .../archive, and git clone/push",
+            "unknown_endpoint",
+        )
+    return error_response(exc.status_code, str(exc.detail), "invalid_request", getattr(exc, "headers", None))
 
 
 @app.exception_handler(Exception)
 async def generic_error_handler(_: Request, exc: Exception) -> JSONResponse:
     logger.exception("Unhandled error: %s", exc)
-    return JSONResponse(status_code=500, content={"ok": False, "error": "Internal server error"})
+    return error_response(500, "Internal server error", "internal_error")
 
 
 def presented_keys(request: Request) -> list[str]:
@@ -132,16 +179,58 @@ def repo_name(owner: str, repo: str) -> tuple[str, str]:
     return owner, repo
 
 
+def check_ref(ref: str) -> str:
+    """Branch, tag, SHA or rev expression (HEAD~2). Git ref names can hold neither '..'
+    nor ':', and refs end up in API URL paths: '..' there would climb out of the repo."""
+    if ".." in ref or ":" in ref or "\\" in ref or len(ref) > 255 or any(ord(c) < 0x20 or c == "\x7f" for c in ref):
+        raise BadRequest("Invalid ref")
+    return ref
+
+
 def split_ref_path(rest: str, ref: str | None) -> tuple[str | None, str]:
     """`main/src/app.py` -> ("main", "src/app.py"). A branch with a slash in its name
     is ambiguous in that form: the caller passes it in `ref` and `rest` is the path."""
+    return ref_candidates(rest, ref)[0]
+
+
+def ref_candidates(rest: str, ref: str | None, *, need_path: bool = False) -> list[tuple[str | None, str]]:
+    """Ways to read `rest` as <ref>/<path>, most likely first. github.com links put a
+    branch like `feature/x` straight in the path (`/blob/feature/x/src/a.py`); when the
+    first reading is not found, the next ones take one more segment into the ref."""
     rest = rest.strip("/")
     if ".." in rest.split("/"):
         raise BadRequest("Path may not contain '..'")
     if ref:
-        return ref, rest
-    head, _, tail = rest.partition("/")
-    return (head or None), tail
+        return [(check_ref(ref), rest)]
+    parts = rest.split("/") if rest else []
+    if not parts:
+        return [(None, "")]
+    last = len(parts) - 1 if need_path else len(parts)
+    first = (check_ref(parts[0]), "/".join(parts[1:]))
+    longer = [("/".join(parts[:i]), "/".join(parts[i:])) for i in range(2, min(last, 4) + 1)]
+    # A longer reading that cannot be a ref name (a file called a..b) is just skipped.
+    return [first] + [(ref, path) for ref, path in longer if is_ref(ref)]
+
+
+def is_ref(ref: str) -> bool:
+    try:
+        check_ref(ref)
+    except BadRequest:
+        return False
+    return True
+
+
+async def first_found(candidates: list[tuple[str | None, str]], fetch):
+    """Run fetch(ref, path) on each reading until one is not a 404."""
+    first_error = None
+    for ref, path in candidates:
+        try:
+            return ref, path, await fetch(ref, path)
+        except GitHubError as exc:
+            if exc.code != "not_found":
+                raise
+            first_error = first_error or exc
+    raise first_error
 
 
 def public_base(request: Request) -> str:
@@ -166,24 +255,34 @@ def compact_repo(raw: dict[str, Any], base: str) -> dict[str, Any]:
 
 def raw_media_type(path: str) -> str:
     guessed, _ = mimetypes.guess_type(path)
-    if not guessed or guessed.startswith("text/") or guessed in ACTIVE_TYPES or guessed in {
-        "application/json",
-        "application/javascript",
-        "application/x-sh",
-        "application/toml",
-        "application/x-yaml",
-    }:
-        return "text/plain; charset=utf-8"
-    return guessed
+    if guessed and guessed != "video/mp2t" and (guessed in BINARY_TYPES or guessed.startswith(BINARY_PREFIXES)):
+        return guessed
+    return "text/plain; charset=utf-8"
+
+
+async def body_of(upstream: httpx.Response, *, raw: bool = False) -> AsyncIterator[bytes]:
+    """Stream the upstream body and always release its connection, even when the client
+    hangs up mid-transfer (an aborted clone must not hold a pooled connection)."""
+    try:
+        async for chunk in upstream.aiter_raw() if raw else upstream.aiter_bytes():
+            yield chunk
+    finally:
+        await upstream.aclose()
 
 
 def stream_back(upstream, *, media_type: str, extra: dict[str, str] | None = None) -> StreamingResponse:
-    headers = {"X-Content-Type-Options": "nosniff", **(extra or {})}
+    # The CSP sandbox is a second lock behind text/plain + nosniff: even a file a browser
+    # decided to render could not run script or reach anything from this origin.
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        **(extra or {}),
+    }
     length = upstream.headers.get("content-length")
     if length and not upstream.headers.get("content-encoding"):
         headers["Content-Length"] = length
     return StreamingResponse(
-        upstream.aiter_bytes(),
+        body_of(upstream),
         status_code=upstream.status_code,
         media_type=media_type,
         headers=headers,
@@ -249,7 +348,7 @@ async def relay_git(request: Request, owner: str, repo: str, suffix: str) -> Res
     out = {name: upstream.headers[name] for name in GIT_RESPONSE_HEADERS if name in upstream.headers}
     # Raw bytes: the body keeps its upstream Content-Encoding, which we forward as is.
     return StreamingResponse(
-        upstream.aiter_raw(),
+        body_of(upstream, raw=True),
         status_code=upstream.status_code,
         headers=out,
         background=BackgroundTask(upstream.aclose),
@@ -282,11 +381,16 @@ async def repo_info(request: Request, owner: str, repo: str) -> dict[str, Any]:
 
 
 @app.get("/{owner}/{repo}/branches", dependencies=[Depends(require_api_key)])
-async def branches(owner: str, repo: str, limit: int = Query(default=100, ge=1, le=100)) -> dict[str, Any]:
+async def branches(
+    owner: str,
+    repo: str,
+    limit: int = Query(default=100, ge=1, le=100),
+    page: int = Query(default=1, ge=1),
+) -> dict[str, Any]:
     owner, repo = repo_name(owner, repo)
-    raw = await github.api_json(f"/repos/{owner}/{repo}/branches", {"per_page": limit})
+    raw = await github.api_json(f"/repos/{owner}/{repo}/branches", {"per_page": limit, "page": page})
     items = [{"name": item["name"], "sha": item["commit"]["sha"], "protected": item.get("protected")} for item in raw]
-    return {"ok": True, "data": {"count": len(items), "branches": items}}
+    return {"ok": True, "data": {"page": page, "count": len(items), "has_more": len(items) == limit, "branches": items}}
 
 
 @app.get("/{owner}/{repo}/commits", dependencies=[Depends(require_api_key)])
@@ -301,7 +405,7 @@ async def commits(
     owner, repo = repo_name(owner, repo)
     params: dict[str, Any] = {"per_page": limit, "page": page}
     if ref:
-        params["sha"] = ref
+        params["sha"] = check_ref(ref)
     if path:
         params["path"] = path
     raw = await github.api_json(f"/repos/{owner}/{repo}/commits", params)
@@ -317,6 +421,63 @@ async def commits(
     return {"ok": True, "data": {"page": page, "count": len(items), "has_more": len(items) == limit, "commits": items}}
 
 
+@app.get("/{owner}/{repo}/commit/{sha:path}", dependencies=[Depends(require_api_key)])
+async def commit(owner: str, repo: str, sha: str, patch: bool = Query(default=True)) -> Response:
+    """One commit with its changed files, like github.com/<owner>/<repo>/commit/<sha>.
+    `<sha>.diff` or `<sha>.patch` returns the whole diff as plain text, as on github.com."""
+    owner, repo = repo_name(owner, repo)
+    for suffix, accept in ((".diff", "application/vnd.github.diff"), (".patch", "application/vnd.github.patch")):
+        if sha.endswith(suffix):
+            ref = check_ref(sha[: -len(suffix)])
+            upstream = await github.api_stream(
+                f"/repos/{owner}/{repo}/commits/{quote(ref, safe='')}", accept=accept
+            )
+            return stream_back(upstream, media_type="text/plain; charset=utf-8")
+    raw = await github.api_json(f"/repos/{owner}/{repo}/commits/{quote(check_ref(sha), safe='')}")
+    budget = MAX_COMMIT_PATCH_CHARS
+    files = []
+    for item in raw.get("files") or []:
+        entry: dict[str, Any] = {
+            "path": item.get("filename"),
+            "status": item.get("status"),
+            "additions": item.get("additions"),
+            "deletions": item.get("deletions"),
+        }
+        if item.get("previous_filename"):
+            entry["previous_path"] = item["previous_filename"]
+        if patch:
+            text = item.get("patch")
+            if text is None:
+                # GitHub leaves it out for binary files and very large diffs.
+                entry["patch"] = None
+            else:
+                keep = min(len(text), MAX_PATCH_CHARS, budget)
+                budget -= keep
+                entry["patch"] = text[:keep]
+                if keep < len(text):
+                    entry["patch_truncated"] = True
+        files.append(entry)
+    info = raw.get("commit") or {}
+    author = info.get("author") or {}
+    return JSONResponse(
+        {
+            "ok": True,
+            "data": {
+                "sha": raw.get("sha"),
+                "message": (info.get("message") or "").strip(),
+                "author": author.get("name"),
+                "date": author.get("date"),
+                "parents": [parent.get("sha") for parent in raw.get("parents") or []],
+                "stats": raw.get("stats"),
+                "files_count": len(files),
+                # GitHub lists at most 300 files per commit in this call: `.diff` has them all.
+                "files_truncated": len(files) >= 300,
+                "files": files,
+            },
+        }
+    )
+
+
 @app.get("/{owner}/{repo}/tree", dependencies=[Depends(require_api_key)])
 @app.get("/{owner}/{repo}/tree/{rest:path}", dependencies=[Depends(require_api_key)])
 async def tree(
@@ -327,44 +488,63 @@ async def tree(
     recursive: bool = Query(default=False, description="Every file under the directory, not just its direct children."),
 ) -> dict[str, Any]:
     owner, repo = repo_name(owner, repo)
-    ref, path = split_ref_path(rest, ref)
     cap = settings.gh_max_tree_entries
     if recursive:
-        raw = await github.api_json(
-            f"/repos/{owner}/{repo}/git/trees/{quote(ref or 'HEAD')}", {"recursive": "1"}
-        )
+
+        async def fetch_tree(ref: str | None, path: str) -> Any:
+            # `<ref>:<dir>` asks GitHub for that subtree only: no whole-repo listing to
+            # filter, and its 100k-entry truncation applies to the directory asked for.
+            treeish = f"{ref or 'HEAD'}:{path}" if path else (ref or "HEAD")
+            return await github.api_json(
+                f"/repos/{owner}/{repo}/git/trees/{quote(treeish, safe='')}", {"recursive": "1"}
+            )
+
+        ref, path, raw = await first_found(ref_candidates(rest, ref), fetch_tree)
         prefix = f"{path}/" if path else ""
         entries = [
-            {"path": item["path"], "type": "dir" if item["type"] == "tree" else "file", "size": item.get("size")}
+            {"path": prefix + item["path"], "type": "dir" if item["type"] == "tree" else "file", "size": item.get("size")}
             for item in raw.get("tree", [])
-            if item["path"].startswith(prefix) and item["type"] in ("blob", "tree")
+            if item["type"] in ("blob", "tree")
         ]
         truncated = bool(raw.get("truncated")) or len(entries) > cap
         return {
             "ok": True,
             "data": {"ref": ref or "HEAD", "path": path, "count": len(entries[:cap]), "truncated": truncated, "entries": entries[:cap]},
         }
-    raw = await github.api_json(f"/repos/{owner}/{repo}/contents/{quote_path(path)}", {"ref": ref} if ref else None)
+
+    async def fetch_contents(ref: str | None, path: str) -> Any:
+        return await github.api_json(f"/repos/{owner}/{repo}/contents/{quote_path(path)}", {"ref": ref} if ref else None)
+
+    ref, path, raw = await first_found(ref_candidates(rest, ref), fetch_contents)
     if isinstance(raw, dict):
         # The path is a file: describe it rather than fail.
         return {"ok": True, "data": {"ref": ref, "path": path, "type": raw.get("type"), "size": raw.get("size")}}
     entries = [{"name": item["name"], "type": item["type"], "size": item.get("size")} for item in raw]
     entries.sort(key=lambda item: (item["type"] != "dir", item["name"].lower()))
-    return {"ok": True, "data": {"ref": ref, "path": path, "count": len(entries[:cap]), "entries": entries[:cap]}}
+    # GitHub itself stops a directory listing at 1000 entries.
+    truncated = len(entries) > cap or len(entries) >= 1000
+    return {
+        "ok": True,
+        "data": {"ref": ref, "path": path, "count": len(entries[:cap]), "truncated": truncated, "entries": entries[:cap]},
+    }
 
 
 @app.get("/{owner}/{repo}/blob/{rest:path}", dependencies=[Depends(require_api_key)])
 @app.get("/{owner}/{repo}/raw/{rest:path}", dependencies=[Depends(require_api_key)])
 async def raw_file(owner: str, repo: str, rest: str, ref: str | None = Query(default=None)) -> Response:
     owner, repo = repo_name(owner, repo)
-    ref, path = split_ref_path(rest, ref)
-    if not path:
+    candidates = ref_candidates(rest, ref, need_path=True)
+    if not candidates[0][1]:
         raise BadRequest("Expected /blob/<ref>/<path to file>")
-    upstream = await github.api_stream(
-        f"/repos/{owner}/{repo}/contents/{quote_path(path)}",
-        accept="application/vnd.github.raw",
-        params={"ref": ref} if ref else None,
-    )
+
+    async def fetch(ref: str | None, path: str) -> httpx.Response:
+        return await github.api_stream(
+            f"/repos/{owner}/{repo}/contents/{quote_path(path)}",
+            accept="application/vnd.github.raw",
+            params={"ref": ref} if ref else None,
+        )
+
+    _, path, upstream = await first_found(candidates, fetch)
     return stream_back(upstream, media_type=raw_media_type(path))
 
 
@@ -377,12 +557,16 @@ async def archive(owner: str, repo: str, name: str) -> Response:
             break
     else:
         raise BadRequest("Expected /archive/<ref>.tar.gz or /archive/<ref>.zip")
-    if not ref or ".." in ref.split("/"):
+    if not ref:
         raise BadRequest("Invalid ref")
-    # GitHub redirects to codeload with a short-lived token in the URL: follow it here
-    # instead of handing that URL out.
+    check_ref(ref)
+    # GitHub redirects to codeload with a short-lived token in the URL: the client follows
+    # it here instead of handing that URL out. Codeload can take a while to start a big
+    # archive, hence the longer read timeout.
     upstream = await github.api_stream(
-        f"/repos/{owner}/{repo}/{kind}/{quote(ref, safe='/')}", accept="*/*", follow_redirects=True
+        f"/repos/{owner}/{repo}/{kind}/{quote(ref, safe='/')}",
+        accept="*/*",
+        timeout=httpx.Timeout(settings.gh_timeout, read=max(settings.gh_timeout, 300.0)),
     )
     filename = f"{repo}-{ref.replace('/', '-')}{suffix}"
     return stream_back(upstream, media_type=media_type, extra={"Content-Disposition": f'attachment; filename="{filename}"'})

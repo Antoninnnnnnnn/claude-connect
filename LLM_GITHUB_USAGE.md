@@ -43,7 +43,9 @@ https://<github-host>
 git clone https://x:<API_KEY>@<github-host>/<owner>/<repo>.git
 ```
 
-Le `.git` final est optionnel. Le protocole git est relaye tel quel vers github.com : `fetch`, `pull`, `ls-remote`, `--depth 1`, `--branch` fonctionnent comme d'habitude.
+Le `.git` final est optionnel. Le protocole git est relaye tel quel vers github.com : `fetch`, `pull`, `ls-remote`, `--depth 1`, `--branch`, `--filter=blob:none` fonctionnent comme d'habitude.
+
+Exporte `GIT_TERMINAL_PROMPT=0` avant tes commandes `git` : si la cle est refusee, git echoue tout de suite au lieu d'attendre un mot de passe au clavier.
 
 Pour un gros repo dont tu n'as besoin que du dernier etat :
 
@@ -53,9 +55,10 @@ git clone --depth 1 https://x:<API_KEY>@<github-host>/<owner>/<repo>.git
 
 ## Pousser
 
-Le remote `origin` du clone pointe deja vers le proxy :
+Le remote `origin` du clone pointe deja vers le proxy. Si `git commit` refuse faute d'identite, configure-la dans le clone (pas en global), avec l'identite donnee par l'utilisateur s'il en a donne une, sinon :
 
 ```bash
+git config user.name "Claude" && git config user.email "noreply@anthropic.com"
 git checkout -b claude/ma-modif
 git commit -am "..."
 git push -u origin claude/ma-modif
@@ -108,7 +111,7 @@ GET /<owner>/<repo>/raw/<ref>/<chemin>
 ```
 
 - `<ref>` : branche, tag ou SHA. Les deux routes sont identiques et renvoient le contenu brut.
-- Branche avec un `/` dans le nom (`feature/x`) : passe-la en parametre, `GET /<owner>/<repo>/blob/<chemin>?ref=feature/x`.
+- Branche avec un `/` dans le nom (`feature/x`) : un lien github.com tel quel (`/blob/feature/x/src/a.py`) fonctionne, le proxy essaie `feature` puis `feature/x`. Plus direct : `GET /<owner>/<repo>/blob/<chemin>?ref=feature/x`.
 - Les fichiers texte (HTML et SVG compris) sont servis en `text/plain` ; images et PDF avec leur type.
 
 ### Parcourir l'arborescence
@@ -122,7 +125,7 @@ GET /<owner>/<repo>/tree/<ref>/<dossier>
 - Sans `<ref>` : branche par defaut.
 - `recursive=true` : tous les fichiers sous le dossier, pas seulement les enfants directs. Ideal pour avoir la carte d'un repo en un appel.
 - `ref=feature/x` : meme regle que pour `/blob`.
-- Plafonne a 2000 entrees ; `truncated: true` si la liste est coupee. Demande alors un sous-dossier.
+- Plafonne a 2000 entrees (1000 sans `recursive`, limite GitHub) ; `truncated: true` si la liste est coupee. Demande alors un sous-dossier.
 
 ```json
 {"ok": true, "data": {"ref": "main", "path": "src", "count": 2, "entries": [
@@ -136,8 +139,10 @@ En mode `recursive`, chaque entree a `path` (chemin complet) au lieu de `name`.
 ### Branches
 
 ```http
-GET /<owner>/<repo>/branches
+GET /<owner>/<repo>/branches?limit=100&page=1
 ```
+
+`has_more: true` : demande `page+1`.
 
 ### Historique
 
@@ -147,6 +152,19 @@ GET /<owner>/<repo>/commits?ref=main&path=src/app.py&limit=20&page=1
 
 - `ref` : branche, tag ou SHA (defaut : branche par defaut).
 - `path` : seulement les commits qui touchent ce chemin.
+
+### Un commit (fichiers modifies et diff)
+
+```http
+GET /<owner>/<repo>/commit/<sha>
+GET /<owner>/<repo>/commit/<sha>?patch=false
+GET /<owner>/<repo>/commit/<sha>.diff
+```
+
+- JSON : message, auteur, `parents`, `stats`, `files_truncated` (GitHub ne liste que 300 fichiers : au-dela, utilise `.diff`), et `files` (`path`, `status`, `additions`, `deletions`, `previous_path` si renomme, `patch`).
+- `patch` est coupe a 20 000 caracteres par fichier et 200 000 au total (`patch_truncated: true`) ; `null` pour un binaire. `patch=false` : la liste des fichiers seule.
+- `<sha>.diff` ou `<sha>.patch` : le diff complet en texte brut, comme sur github.com.
+- `<sha>` peut aussi etre une branche ou un tag (dernier commit).
 
 ### Archive
 
@@ -168,6 +186,7 @@ Snapshot du repo sans historique, utile si `git` n'est pas disponible.
 | `empty_repository` (409) | Repo sans aucun commit. |
 | `bad_token` (502) | Le token GitHub du serveur est expire ou revoque : previens l'utilisateur. |
 | `no_token` (503) | Le serveur n'a pas de token GitHub : seuls les repos publics sont lisibles. |
-| `invalid_request` (422) | Nom de repo, chemin ou ref invalide. |
+| `invalid_request` (422) | Nom de repo, chemin ou ref invalide, ou ref/SHA refuse par GitHub (le motif GitHub est dans `error`). |
+| `unknown_endpoint` (404) | URL github.com non reprise par le proxy (`/pull/...`, `/issues`, `/compare/...`). |
 
 Cote `git`, les refus arrivent en `remote: ...` suivi d'un 403 ou 404.
